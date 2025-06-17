@@ -524,8 +524,9 @@ func (g *Group) Replay(start, end time.Time, rw remotewrite.RWClient, maxDataPoi
 	}
 
 	if g.Concurrency > 1 && replayDelay > 0 {
-		fmt.Printf("\nPlease not, concurrency value of %d will be ignored since `-replay.rulesDelay` is %d seconds."+
-			"Set -replay.rulesDelay=0 to enable concurrency rule replay", g.Concurrency, replayDelay*time.Second)
+		fmt.Printf("\nPlease not, concurrency value of %d will be ignored since `-replay.rulesDelay` is %.3f seconds."+
+			"Set -replay.rulesDelay=0 to enable concurrency rule replay", g.Concurrency, replayDelay.Seconds())
+
 	}
 
 	if g.Concurrency == 1 || replayDelay > 0 {
@@ -595,7 +596,7 @@ func replayRuleRange(r Rule, ri rangeIterator, bar *pb.ProgressBar, rw remotewri
 				logger.Fatalf("rule %q: %s", r, err)
 			}
 			if bar != nil {
-				bar.Increment()
+				bar.Finish()
 			}
 			res <- n
 			<-sem
