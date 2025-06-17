@@ -507,7 +507,7 @@ func (g *Group) infof(format string, args ...any) {
 }
 
 // Replay performs group replay
-func (g *Group) Replay(start, end time.Time, rw remotewrite.RWClient, maxDataPoint, replayRuleRetryAttempts int, replayDelay time.Duration, disableProgressBar bool) int {
+func (g *Group) Replay(start, end time.Time, rw remotewrite.RWClient, maxDataPoint, replayRuleRetryAttempts int, replayDelay time.Duration, disableProgressBar bool, singleRuleConcurrency int) int {
 	var total int
 	step := g.Interval * time.Duration(maxDataPoint)
 	ri := rangeIterator{start: start, end: end, step: step}
@@ -534,7 +534,7 @@ func (g *Group) Replay(start, end time.Time, rw remotewrite.RWClient, maxDataPoi
 			if !disableProgressBar {
 				bar = pb.StartNew(iterations)
 			}
-			total += replayRuleRange(rule, ri, bar, rw, replayRuleRetryAttempts)
+			total += replayRuleRange(rule, ri, bar, rw, replayRuleRetryAttempts, singleRuleConcurrency)
 			if bar != nil {
 				bar.Finish()
 			}
@@ -556,7 +556,7 @@ func (g *Group) Replay(start, end time.Time, rw remotewrite.RWClient, maxDataPoi
 		sem <- struct{}{}
 		wg.Add(1)
 		go func(r Rule, ri rangeIterator) {
-			res <- replayRuleRange(r, ri, bar, rw, replayRuleRetryAttempts)
+			res <- replayRuleRange(r, ri, bar, rw, replayRuleRetryAttempts, singleRuleConcurrency)
 			<-sem
 			wg.Done()
 		}(r, rangeIterator{start: start, end: end, step: step})
@@ -577,18 +577,37 @@ func (g *Group) Replay(start, end time.Time, rw remotewrite.RWClient, maxDataPoi
 	return total
 }
 
-func replayRuleRange(r Rule, ri rangeIterator, bar *pb.ProgressBar, rw remotewrite.RWClient, replayRuleRetryAttempts int) int {
+func replayRuleRange(r Rule, ri rangeIterator, bar *pb.ProgressBar, rw remotewrite.RWClient, replayRuleRetryAttempts int, singleRuleConcurrency int) int {
 	fmt.Printf("> Rule %q (ID: %d)\n", r, r.ID())
-	total := 0
+	sem := make(chan struct{}, singleRuleConcurrency)
+	wg := sync.WaitGroup{}
+	res := make(chan int, int(ri.end.Sub(ri.start)/ri.step)+1)
+
 	ri.reset()
 	for ri.next() {
-		n, err := replayRule(r, ri.s, ri.e, rw, replayRuleRetryAttempts)
-		if err != nil {
-			logger.Fatalf("rule %q: %s", r, err)
-		}
-		if bar != nil {
-			bar.Increment()
-		}
+		sem <- struct{}{}
+		wg.Add(1)
+
+		go func(s, e time.Time) {
+			fmt.Println(s, e)
+			n, err := replayRule(r, s, e, rw, replayRuleRetryAttempts)
+			if err != nil {
+				logger.Fatalf("rule %q: %s", r, err)
+			}
+			if bar != nil {
+				bar.Increment()
+			}
+			res <- n
+			<-sem
+			wg.Done()
+		}(ri.s, ri.e)
+	}
+	wg.Wait()
+	close(res)
+	close(sem)
+
+	total := 0
+	for n := range res {
 		total += n
 	}
 	return total
