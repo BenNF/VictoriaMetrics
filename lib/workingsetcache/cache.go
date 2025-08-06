@@ -21,6 +21,9 @@ var (
 		"becomes lower than this value. Higher values reduce memory usage at the cost of higher CPU usage. See also -cacheExpireDuration")
 	cacheExpireDuration = flag.Duration("cacheExpireDuration", 30*time.Minute, "Items are removed from in-memory caches after they aren't accessed for this duration. "+
 		"Lower values may reduce memory usage at the cost of higher CPU usage. See also -prevCacheRemovalPercent")
+	cacheWholeModeEnabled = flag.Bool("cacheWholeModeEnabled", true, "If enabled, the cache will switch to whole mode when it is filled for more than 50% of its size,"+
+		" stopping eviction via cacheExpireDuration and prevCacheRemovalPercent flags. In most cases this is desirable and produces more efficient caching."+
+		" Disable only with clear understanding of the consequences.")
 )
 
 // Cache modes.
@@ -154,11 +157,15 @@ func (c *Cache) runWatchers(expireDuration time.Duration) {
 		defer c.wg.Done()
 		c.prevCacheWatcher()
 	}()
-	c.wg.Add(1)
-	go func() {
-		defer c.wg.Done()
-		c.cacheSizeWatcher()
-	}()
+
+	if *cacheWholeModeEnabled {
+		c.wg.Add(1)
+		go func() {
+			defer c.wg.Done()
+			c.cacheSizeWatcher()
+		}()
+	}
+
 }
 
 func (c *Cache) expirationWatcher(expireDuration time.Duration) {
