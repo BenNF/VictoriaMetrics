@@ -13,7 +13,6 @@ import (
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bloomfilter"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/cgroup"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/consistenthash"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/flagutil"
@@ -144,8 +143,8 @@ func InitSecretFlags() {
 }
 
 var (
-	shardByURLLabelsMap       map[string]struct{}
-	shardByURLIgnoreLabelsMap map[string]struct{}
+	shardByURLLabelsFilter       []string
+	shardByURLIgnoreLabelsFilter []string
 )
 
 // Init initializes remotewrite.
@@ -187,8 +186,8 @@ func Init() {
 		logger.Fatalf("-remoteWrite.shardByURL.labels and -remoteWrite.shardByURL.ignoreLabels cannot be set simultaneously; " +
 			"see https://docs.victoriametrics.com/victoriametrics/vmagent/#sharding-among-remote-storages")
 	}
-	shardByURLLabelsMap = newMapFromStrings(*shardByURLLabels)
-	shardByURLIgnoreLabelsMap = newMapFromStrings(*shardByURLIgnoreLabels)
+	shardByURLLabelsFilter = slices.Clone(*shardByURLLabels)
+	shardByURLIgnoreLabelsFilter = slices.Clone(*shardByURLIgnoreLabels)
 
 	initLabelsGlobal()
 
@@ -686,18 +685,18 @@ func shardAmountRemoteWriteCtx(tssBlock []prompb.TimeSeries, shards [][]prompb.T
 
 	for _, ts := range tssBlock {
 		hashLabels := ts.Labels
-		if len(shardByURLLabelsMap) > 0 {
+		if len(shardByURLLabelsFilter) > 0 {
 			hashLabels = tmpLabels.Labels[:0]
 			for _, label := range ts.Labels {
-				if _, ok := shardByURLLabelsMap[label.Name]; ok {
+				if slices.Contains(shardByURLLabelsFilter, label.Name) {
 					hashLabels = append(hashLabels, label)
 				}
 			}
 			tmpLabels.Labels = hashLabels
-		} else if len(shardByURLIgnoreLabelsMap) > 0 {
+		} else if len(shardByURLIgnoreLabelsFilter) > 0 {
 			hashLabels = tmpLabels.Labels[:0]
 			for _, label := range ts.Labels {
-				if _, ok := shardByURLIgnoreLabelsMap[label.Name]; !ok {
+				if !slices.Contains(shardByURLIgnoreLabelsFilter, label.Name) {
 					hashLabels = append(hashLabels, label)
 				}
 			}
@@ -795,19 +794,14 @@ var (
 )
 
 func getLabelsHash(labels []prompb.Label) uint64 {
-	bb := labelsHashBufPool.Get()
-	b := bb.B[:0]
+	var d xxhash.Digest
+	d.Reset()
 	for _, label := range labels {
-		b = append(b, label.Name...)
-		b = append(b, label.Value...)
+		_, _ = d.WriteString(label.Name)
+		_, _ = d.WriteString(label.Value)
 	}
-	h := xxhash.Sum64(b)
-	bb.B = b
-	labelsHashBufPool.Put(bb)
-	return h
+	return d.Sum64()
 }
-
-var labelsHashBufPool bytesutil.ByteBufferPool
 
 func logSkippedSeries(labels []prompb.Label, flagName string, flagValue int) {
 	select {
@@ -1116,12 +1110,4 @@ func getRowsCount(tss []prompb.TimeSeries) int {
 		rowsCount += len(ts.Samples)
 	}
 	return rowsCount
-}
-
-func newMapFromStrings(a []string) map[string]struct{} {
-	m := make(map[string]struct{}, len(a))
-	for _, s := range a {
-		m[s] = struct{}{}
-	}
-	return m
 }
