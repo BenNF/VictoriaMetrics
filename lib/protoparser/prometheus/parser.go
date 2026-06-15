@@ -747,7 +747,7 @@ func AreIdenticalSeriesFast(s1, s2 string) bool {
 }
 
 func isNumeric(s string) bool {
-	for i := 0; i < len(s); i++ {
+	for i := range len(s) {
 		if numericChars[s[i]] {
 			continue
 		}
@@ -788,7 +788,7 @@ var numericChars = [256]bool{
 // # TYPE alertmanager_alerts gauge
 type Metadata struct {
 	Metric string
-	Type   uint32
+	Type   prompb.MetricType
 	Help   string
 }
 
@@ -875,15 +875,25 @@ func unmarshalMetadata(dst []Metadata, s string, errLogger func(s string)) []Met
 	if isType {
 		switch commentData {
 		case "counter":
-			md.Type = uint32(prompb.MetricMetadataCOUNTER)
+			md.Type = prompb.MetricTypeCounter
 		case "gauge":
-			md.Type = uint32(prompb.MetricMetadataGAUGE)
+			md.Type = prompb.MetricTypeGauge
 		case "histogram":
-			md.Type = uint32(prompb.MetricMetadataHISTOGRAM)
+			md.Type = prompb.MetricTypeHistogram
 		case "summary":
-			md.Type = uint32(prompb.MetricMetadataSUMMARY)
-		case "untyped":
-			md.Type = uint32(prompb.MetricMetadataUNKNOWN)
+			md.Type = prompb.MetricTypeSummary
+		case "untyped", "unknown":
+			// "untyped" is the Prometheus exposition format name; "unknown" is the OpenMetrics equivalent.
+			md.Type = prompb.MetricTypeUnknown
+		case "info":
+			// OpenMetrics info type - see https://github.com/OpenObservability/OpenMetrics/blob/main/specification/OpenMetrics.md
+			md.Type = prompb.MetricTypeInfo
+		case "gaugehistogram":
+			// OpenMetrics GaugeHistogram type
+			md.Type = prompb.MetricTypeGaugeHistogram
+		case "stateset":
+			// OpenMetrics StateSet type
+			md.Type = prompb.MetricTypeStateset
 		default:
 			if errLogger != nil {
 				errLogger(fmt.Sprintf("cannot unmarshal metadata line %q: TYPE is invalid", fullLine))

@@ -16,22 +16,24 @@ See also [case studies](https://docs.victoriametrics.com/victoriametrics/casestu
 ## Third-party articles and slides about VictoriaMetrics
 
 * [Spotify: faster insights and improved accuracy after the upgrade from Heroic to VictoriaMetrics](https://www.youtube.com/watch?v=87koDlpKDR4)
-* [Datanami: Why Roblox Picked VictoriaMetrics for Observability Data Overhaul](https://www.datanami.com/2023/05/30/why-roblox-picked-victoriametrics-for-observability-data-overhaul/)
+* [Datanami: Why Roblox Picked VictoriaMetrics for Observability Data Overhaul](https://www.hpcwire.com/bigdatawire/2023/05/30/why-roblox-picked-victoriametrics-for-observability-data-overhaul/)
 * [Cloudflare: Introducing notifications for HTTP Traffic Anomalies](https://blog.cloudflare.com/introducing-http-traffic-anomalies-notifications/)
 * [Grammarly: Better, Faster, Cheaper: How Grammarly Improved Monitoring by Over 10x with VictoriaMetrics](https://www.grammarly.com/blog/engineering/monitoring-with-victoriametrics/)
 * [CERN: CMS monitoring R&D: Real-time monitoring and alerts](https://indico.cern.ch/event/877333/contributions/3696707/attachments/1972189/3281133/CMS_mon_RD_for_opInt.pdf)
 * [CERN: The CMS monitoring infrastructure and applications](https://arxiv.org/pdf/2007.03630.pdf)
 * [Forbes: The (Almost) Infinitely Scalable Open Source Monitoring Dream](https://www.forbes.com/sites/adrianbridgwater/2022/08/16/the-almost-infinitely-scalable-open-source-monitoring-dream/)
 * [Forbes: The Agility In Cloud Observability](https://www.forbes.com/sites/adrianbridgwater/2023/07/05/the-agility-in-cloud-observability/)
+* [Airbnb: Building a high-volume metrics pipeline with OpenTelemetry and vmagent](https://medium.com/airbnb-engineering/building-a-high-volume-metrics-pipeline-with-opentelemetry-and-vmagent-c714d6910b45)
 * [Bedrock: Monitoring at scale with Victoria Metrics](https://tech.bedrockstreaming.com/2022/09/06/monitoring-at-scale-with-victoriametrics.html)
 * [TiDB by PingCap: Scaling Observability: Why TiDB Moved from Prometheus to VictoriaMetrics](https://www.pingcap.com/blog/tidb-observability-migrating-prometheus-victoriametrics/)
+* [TigrisData: We do our billing with Prometheus](https://www.tigrisdata.com/blog/billing-prometheus/)
 * [Percona: Optimizing the Storage of Large Volumes of Metrics for a Long Time in VictoriaMetrics](https://percona.community/blog/2022/06/02/long-time-keeping-metrics-victoriametrics/)
 * [Percona: Foiled by the Firewall: A Tale of Transition From Prometheus to VictoriaMetrics](https://www.percona.com/blog/2020/12/01/foiled-by-the-firewall-a-tale-of-transition-from-prometheus-to-victoriametrics/)
 * [Percona: Observations on Better Resource Usage with Percona Monitoring and Management v2.12.0](https://www.percona.com/blog/2020/12/23/observations-on-better-resource-usage-with-percona-monitoring-and-management-v2-12-0/)
 * [Percona: How do We Keep Metrics for a Long Time in VictoriaMetrics](https://www.youtube.com/watch?v=SGZjY7xgDwE)
 * [Miro: Prometheus High Availability and Fault Tolerance strategy, long term storage with VictoriaMetrics](https://medium.com/miro-engineering/prometheus-high-availability-and-fault-tolerance-strategy-long-term-storage-with-victoriametrics-82f6f3f0409e)
 * [ZERODHA: Infrastructure monitoring with Prometheus at Zerodha](https://zerodha.tech/blog/infra-monitoring-at-zerodha/)
-* [ZERODHA: Monitoring K8S with VictoriaMetrics](https://docs.google.com/presentation/d/1g7yUyVEaAp4tPuRy-MZbPXKqJ1z78_5VKuV841aQfsg/edit)
+* [ZERODHA: Monitoring K8s with Victoriametrics](https://www.youtube.com/watch?v=ZJQYW-cFOms)
 * [Criteo: VictoriaMetrics, a stress-free Prometheus Remote Storage for 1 Billion metrics](https://medium.com/criteo-engineering/victoriametrics-a-prometheus-remote-storage-solution-57081a3d8e61)
 * [Abios Gaming: Choosing a Time Series Database for High Cardinality Aggregations](https://abiosgaming.com/press/high-cardinality-aggregations/)
 * [Cybozu: Monitoring Kubernetes clusters with VictoriaMetrics and Grafana](https://blog.cybozu.io/entry/2021/03/18/115743)
@@ -67,7 +69,6 @@ See also [case studies](https://docs.victoriametrics.com/victoriametrics/casestu
 * [High-performance Graphite storage solution on top of VictoriaMetrics](https://github.com/zhihu/promate)
 * [Cloud Native Model Driven Telemetry Stack on OpenShift](https://cer6erus.medium.com/cloud-native-model-driven-telemetry-stack-on-openshift-80712621f5bc)
 * [Prometheus VictoriaMetrics On AWS ECS](https://dalefro.medium.com/prometheus-victoria-metrics-on-aws-ecs-62448e266090)
-* [Solving Metrics at scale with VictoriaMetrics](https://www.youtube.com/watch?v=QgLMztnj7-8)
 * [Monitoring as Code на базе VictoriaMetrics и Grafana](https://habr.com/ru/post/568090/)
 * [Push Prometheus metrics to VictoriaMetrics or other exporters](https://github.com/gistart/prometheus-push-client)
 * [Superset BI with Victoria Metrics](https://cer6erus.medium.com/superset-bi-with-victoria-metrics-a109d3e91bc6)
@@ -81,7 +82,7 @@ See also [case studies](https://docs.victoriametrics.com/victoriametrics/casestu
 * [VictoriaMetrics: an overview and its use instead of Prometheus](https://rtfm.co.ua/en/victoriametrics-an-overview-and-its-use-instead-of-prometheus/)
 * [VictoriaMetrics: deploying a Kubernetes monitoring stack](https://rtfm.co.ua/en/victoriametrics-deploying-a-kubernetes-monitoring-stack/)
 * [VictoriaMetrics: VMAuth – Proxy, Authentication, and Authorization](https://rtfm.co.ua/en/victoriametrics-vmauth-proxy-authentication-and-authorization/)
-* [Solving metrics at scale with VictoriaMetrics](https://sarthak-acoustic.medium.com/solving-metrics-at-scale-with-victoriametrics-ac9c306826c3)
+* [Solving metrics at scale with VictoriaMetrics](https://sarthak-acoustic.medium.com/solving-metrics-at-scale-with-victoriametrics-ac9c306826c3) and [video](https://www.youtube.com/watch?v=QgLMztnj7-8)
 * [VictoriaMetrics: a comprehensive guide](https://medium.com/@seifeddinerajhi/victoriametrics-a-comprehensive-guide-comparing-it-to-prometheus-and-implementing-kubernetes-03eb8feb0cc2)
 * [Unleashing VM histograms for Ruby: Migrating from Prometheus to VictoriaMetrics with vm-client](https://hackernoon.com/unleashing-vm-histograms-for-ruby-migrating-from-prometheus-to-victoriametrics-with-vm-client)
 * [Observe and record performance of Spark jobs with Victoria Metrics](https://medium.com/constructor-engineering/observe-and-record-performance-of-databricks-jobs-11ffe236555e)
@@ -102,7 +103,16 @@ See also [case studies](https://docs.victoriametrics.com/victoriametrics/casestu
 * [When metrics leak secrets: Kubernetes CTF lessons](https://programmerprodigy.code.blog/2025/09/01/when-metrics-leak-secrets-kubernetes-ctf-lessons/)
 * [K3S and monitoring with VictoriaMetrics, kube-state-metrics, node-exporter and Grafana](https://j.hommet.net/k3s-victoriametrics-kube-state-metrics-node-exporter-grafana/)
 * [How We Eliminated $10K+/Year in AWS Cross-Zone Data Transfer Costs with Zone-Aware Kubernetes Monitoring](https://medium.com/@vijayrauniyar1818/how-we-eliminated-10k-year-in-aws-cross-zone-data-transfer-costs-with-zone-aware-kubernetes-09fff0c2435b)
-* [We do our billing with Prometheus](https://www.tigrisdata.com/blog/billing-prometheus/)
+* [Why I Switched to VictoriaMetrics: Scaling from Small Business to Enterprise](https://blackmetalz.github.io/why-i-switched-to-victoriametrics-scaling-from-small-business-to-enterprise.html)
+* [Backing up VictoriaMetrics Data: A Complete Guide](https://medium.com/@kanakaraju896/backing-up-victoriametrics-data-a-complete-guide-24473c74450f)
+* [Unlocking the Power of VictoriaMetrics: A Prometheus Alternative](https://developer-friendly.blog/blog/2024/06/17/unlocking-the-power-of-victoriametrics-a-prometheus-alternative/)
+* [How to Master Kubernetes Observability: Multi-Cluster Monitoring with VictoriaMetrics, Loki, and Grafana](https://www.keyvalue.systems/blog/kubernetes-observability-with-victoriametrics-loki-grafana/)
+* [A Complete Guide to VictoriaMetrics, a Prometheus Comparison, and Kubernetes Monitoring Implementation](https://apprecode.com/blog/a-complete-guide-to-victoriametrics-a-prometheus-comparison-and-kubernetes-monitoring-implementation)
+* [Monitoring Pipeline with Prometheus and VictoriaMetrics](https://clovisc.medium.com/monitoring-pipeline-with-blackbox-exporter-prometheus-victoriametrics-and-vmalert-0ab020c7202a)
+* [FreeBSD: monitoring with VictoriaMetrics and Grafana](https://setevoy.medium.com/freebsd-monitoring-with-victoriametrics-and-grafana-f789904f2628)
+* [QCon London 2026: Wrangling Telemetry at Scale, a Guide to Self-Hosted Observability](https://www.infoq.com/news/2026/03/self-hosted-observability/)
+* [How We Made Telemetry Queries 10x Faster: Chunk-Split Caching for Metrics, Logs, and Traces](https://mirastacklabs.ai/blog/chunk-split-caching/)
+* [Claude Code: creating Kubernetes debugging AI Agent for VictoriaMetrics](https://rtfm.co.ua/en/claude-code-creating-kubernetes-debugging-ai-agent-for-victoriametrics/)
 
 ## Third-party articles and slides about VictoriaLogs
 
@@ -145,6 +155,8 @@ See [our blog](https://victoriametrics.com/blog) for the latest articles written
 * [How do open source solutions for logs work: Elasticsearch, Loki and VictoriaLogs](https://itnext.io/how-do-open-source-solutions-for-logs-work-elasticsearch-loki-and-victorialogs-9f7097ecbc2f)
 
 ### Tutorials, guides and how-to articles
+
+See [our guides](https://docs.victoriametrics.com/guides/) for the up-to-date guides and tutorials.
 
 * [Monitoring VictoriaMetrics](https://victoriametrics.com/blog/victoriametrics-monitoring/)
 * [PromQL tutorial for beginners and humans](https://valyala.medium.com/promql-tutorial-for-beginners-9ab455142085)

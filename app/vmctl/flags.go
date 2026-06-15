@@ -14,6 +14,12 @@ const (
 	globalSilent             = "s"
 	globalVerbose            = "verbose"
 	globalDisableProgressBar = "disable-progress-bar"
+
+	globalPushMetricsURL         = "pushmetrics.url"
+	globalPushMetricsInterval    = "pushmetrics.interval"
+	globalPushExtraLabels        = "pushmetrics.extraLabel"
+	globalPushHeaders            = "pushmetrics.header"
+	globalPushDisableCompression = "pushmetrics.disableCompression"
 )
 
 var (
@@ -33,6 +39,29 @@ var (
 			Value: false,
 			Usage: "Whether to disable progress bar during the import.",
 		},
+		&cli.StringSliceFlag{
+			Name:  globalPushMetricsURL,
+			Usage: "Optional URL to push metrics. See https://docs.victoriametrics.com/victoriametrics/single-server-victoriametrics/#push-metrics",
+		},
+		&cli.DurationFlag{
+			Name:  globalPushMetricsInterval,
+			Value: 10 * time.Second,
+			Usage: "Interval for pushing metrics to every -pushmetrics.url",
+		},
+		&cli.StringSliceFlag{
+			Name: globalPushExtraLabels,
+			Usage: "Extra labels to add to pushed metrics. In case of collision, label value defined by flag will have priority. " +
+				"Flag can be set multiple times, to add few additional labels. " +
+				"For example, -pushmetrics.extraLabel='instance=\"foo\"' adds instance=\"foo\" label to all the metrics pushed to every -pushmetrics.url",
+		},
+		&cli.StringSliceFlag{
+			Name:  globalPushHeaders,
+			Usage: "Optional HTTP headers to add to pushed metrics. Flag can be set multiple times, to add few additional headers.",
+		},
+		&cli.BoolFlag{
+			Name:  globalPushDisableCompression,
+			Usage: "Whether to disable compression when pushing metrics.",
+		},
 	}
 )
 
@@ -40,6 +69,8 @@ const (
 	vmAddr               = "vm-addr"
 	vmUser               = "vm-user"
 	vmPassword           = "vm-password"
+	vmHeaders            = "vm-headers"
+	vmBearerToken        = "vm-bearer-token"
 	vmAccountID          = "vm-account-id"
 	vmConcurrency        = "vm-concurrency"
 	vmCompress           = "vm-compress"
@@ -84,6 +115,16 @@ var (
 			EnvVars: []string{"VM_PASSWORD"},
 		},
 		&cli.StringFlag{
+			Name: vmHeaders,
+			Usage: "Optional HTTP headers to send with each request to the corresponding destination address. \n" +
+				"For example, --vm-headers='My-Auth:foobar' would send 'My-Auth: foobar' HTTP header with every request to the corresponding destination address. \n" +
+				"Multiple headers must be delimited by '^^': --vm-headers='header1:value1^^header2:value2'",
+		},
+		&cli.StringFlag{
+			Name:  vmBearerToken,
+			Usage: "Optional bearer auth token to use for the corresponding --vm-addr",
+		},
+		&cli.StringFlag{
 			Name: vmAccountID,
 			Usage: "AccountID is an arbitrary 32-bit integer identifying namespace for data ingestion (aka tenant). \n" +
 				"AccountID is required when importing into the clustered version of VictoriaMetrics. \n" +
@@ -117,38 +158,39 @@ var (
 			Name:  vmRoundDigits,
 			Value: 100,
 			Usage: "Round metric values to the given number of decimal digits after the point. " +
-				"This option may be used for increasing on-disk compression level for the stored metrics",
+				"This option may be used for increasing on-disk compression level for the stored metrics. " +
+				"See also --vm-significant-figures option",
 		},
 		&cli.StringSliceFlag{
 			Name:  vmExtraLabel,
 			Value: nil,
 			Usage: "Extra labels, that will be added to imported timeseries. In case of collision, label value defined by flag" +
-				"will have priority. Flag can be set multiple times, to add few additional labels.",
+				" will have priority. Flag can be set multiple times, to add few additional labels.",
 		},
 		&cli.Int64Flag{
 			Name: vmRateLimit,
 			Usage: "Optional data transfer rate limit in bytes per second.\n" +
-				"By default, the rate limit is disabled. It can be useful for limiting load on configured via '--vmAddr' destination.",
+				"By default, the rate limit is disabled. It can be useful for limiting load on configured via '--vm-addr' destination.",
 		},
 		&cli.StringFlag{
 			Name:  vmCertFile,
-			Usage: "Optional path to client-side TLS certificate file to use when connecting to '--vmAddr'",
+			Usage: "Optional path to client-side TLS certificate file to use when connecting to '--vm-addr'",
 		},
 		&cli.StringFlag{
 			Name:  vmKeyFile,
-			Usage: "Optional path to client-side TLS key to use when connecting to '--vmAddr'",
+			Usage: "Optional path to client-side TLS key to use when connecting to '--vm-addr'",
 		},
 		&cli.StringFlag{
 			Name:  vmCAFile,
-			Usage: "Optional path to TLS CA file to use for verifying connections to '--vmAddr'. By default, system CA is used",
+			Usage: "Optional path to TLS CA file to use for verifying connections to '--vm-addr'. By default, system CA is used",
 		},
 		&cli.StringFlag{
 			Name:  vmServerName,
-			Usage: "Optional TLS server name to use for connections to '--vmAddr'. By default, the server name from '--vmAddr' is used",
+			Usage: "Optional TLS server name to use for connections to '--vm-addr'. By default, the server name from '--vm-addr' is used",
 		},
 		&cli.BoolFlag{
 			Name:  vmInsecureSkipVerify,
-			Usage: "Whether to skip tls verification when connecting to '--vmAddr'",
+			Usage: "Whether to skip tls verification when connecting to '--vm-addr'",
 			Value: false,
 		},
 		&cli.IntFlag{
@@ -387,6 +429,16 @@ const (
 	promTemporaryDirPath = "prom-tmp-dir-path"
 )
 
+const (
+	thanosSnapshot         = "thanos-snapshot"
+	thanosConcurrency      = "thanos-concurrency"
+	thanosFilterTimeStart  = "thanos-filter-time-start"
+	thanosFilterTimeEnd    = "thanos-filter-time-end"
+	thanosFilterLabel      = "thanos-filter-label"
+	thanosFilterLabelValue = "thanos-filter-label-value"
+	thanosAggrTypes        = "thanos-aggr-types"
+)
+
 var (
 	promFlags = []cli.Flag{
 		&cli.StringFlag{
@@ -420,6 +472,133 @@ var (
 			Name:  promTemporaryDirPath,
 			Usage: "Path to directory to be used for temporary files.",
 			Value: os.TempDir(),
+		},
+	}
+
+	thanosFlags = []cli.Flag{
+		&cli.StringFlag{
+			Name:     thanosSnapshot,
+			Usage:    "Path to Thanos snapshot directory containing raw and/or downsampled blocks.",
+			Required: true,
+		},
+		&cli.IntFlag{
+			Name:  thanosConcurrency,
+			Usage: "Number of concurrently running snapshot readers",
+			Value: 1,
+		},
+		&cli.StringFlag{
+			Name:  thanosFilterTimeStart,
+			Usage: "The time filter in RFC3339 format to select timeseries with timestamp equal or higher than provided value. E.g. '2020-01-01T20:07:00Z'",
+		},
+		&cli.StringFlag{
+			Name:  thanosFilterTimeEnd,
+			Usage: "The time filter in RFC3339 format to select timeseries with timestamp equal or lower than provided value. E.g. '2020-01-01T20:07:00Z'",
+		},
+		&cli.StringFlag{
+			Name:  thanosFilterLabel,
+			Usage: "Thanos label name to filter timeseries by. E.g. '__name__' will filter timeseries by name.",
+		},
+		&cli.StringFlag{
+			Name:  thanosFilterLabelValue,
+			Usage: fmt.Sprintf("Thanos regular expression to filter label from %q flag.", thanosFilterLabel),
+			Value: ".*",
+		},
+		&cli.StringSliceFlag{
+			Name: thanosAggrTypes,
+			Usage: "Aggregate types to import from Thanos downsampled blocks. Supported values: count, sum, min, max, counter. " +
+				"Each aggregate will be imported as a separate metric with the aggregate type as suffix (e.g., metric_name:5m:count). " +
+				"If not specified, all aggregate types will be imported from downsampled blocks.",
+			Value: nil,
+		},
+	}
+)
+
+const (
+	mimirPath             = "mimir-path"
+	mimirTenantID         = "mimir-tenant-id"
+	mimirConcurrency      = "mimir-concurrency"
+	mimirFilterTimeStart  = "mimir-filter-time-start"
+	mimirFilterTimeEnd    = "mimir-filter-time-end"
+	mimirFilterLabel      = "mimir-filter-label"
+	mimirFilterLabelValue = "mimir-filter-label-value"
+
+	mimirCredsFilePath           = "mimir-creds-file-path"
+	mimirConfigFilePath          = "mimir-config-file-path"
+	mimirConfigProfile           = "mimir-config-profile"
+	mimirCustomS3Endpoint        = "mimir-custom-s3-endpoint"
+	mimirS3ForcePathStyle        = "mimir-s3-force-path-style"
+	mimirS3TLSInsecureSkipVerify = "mimir-s3-tls-insecure-skip-verify"
+	mimirSSEKMSKeyID             = "mimir-s3-sse-kms-key-id"
+	mimirSSEAlgorithm            = "mimir-s3-sse-algorithm"
+)
+
+var (
+	mimirFlags = []cli.Flag{
+		&cli.StringFlag{
+			Name:     mimirPath,
+			Usage:    "Path to Mimir storage bucket or local folder.",
+			Required: true,
+		},
+		&cli.StringFlag{
+			Name:  mimirTenantID,
+			Usage: "Tenant ID for Mimir storage",
+		},
+		&cli.IntFlag{
+			Name:  mimirConcurrency,
+			Usage: "Number of concurrently running block readers",
+			Value: 1,
+		},
+		&cli.StringFlag{
+			Name:     mimirFilterTimeStart,
+			Usage:    "The time filter in RFC3339 format to select timeseries with timestamp equal or higher than provided value. E.g. '2020-01-01T20:07:00Z'",
+			Required: true,
+		},
+		&cli.StringFlag{
+			Name:     mimirFilterTimeEnd,
+			Usage:    "The time filter in RFC3339 format to select timeseries with timestamp equal or lower than provided value. E.g. '2020-01-01T20:07:00Z'",
+			Required: true,
+		},
+		&cli.StringFlag{
+			Name:  mimirFilterLabel,
+			Usage: "Mimir label name to filter timeseries by. E.g. '__name__' will filter timeseries by name.",
+		},
+		&cli.StringFlag{
+			Name:  mimirFilterLabelValue,
+			Usage: fmt.Sprintf("Regular expression to filter label from %q flag.", mimirFilterLabel),
+			Value: ".*",
+		},
+		&cli.StringFlag{
+			Name:  mimirCredsFilePath,
+			Usage: "Path to file with GCS or S3 credentials. Credentials are loaded from default locations if not set. See https://cloud.google.com/iam/docs/creating-managing-service-account-keys and https://docs.aws.amazon.com/general/latest/gr/aws-security-credentials.html",
+		},
+		&cli.StringFlag{
+			Name:  mimirConfigFilePath,
+			Usage: "Path to file with S3 configs. Configs are loaded from default location if not set. See https://docs.aws.amazon.com/general/latest/gr/aws-security-credentials.html",
+		},
+		&cli.StringFlag{
+			Name:  mimirConfigProfile,
+			Usage: "Profile name for S3 configs. If no set, the value of the environment variable will be loaded (AWS_PROFILE or AWS_DEFAULT_PROFILE), or if both not set, DefaultSharedConfigProfile is used",
+		},
+		&cli.StringFlag{
+			Name:  mimirCustomS3Endpoint,
+			Usage: "Custom S3 endpoint for use with S3-compatible storages (e.g. MinIO). S3 is used if not set",
+		},
+		&cli.BoolFlag{
+			Name:  mimirS3ForcePathStyle,
+			Usage: "Prefixing endpoint with bucket name when set false, true by default.",
+			Value: true,
+		},
+		&cli.BoolFlag{
+			Name:  mimirS3TLSInsecureSkipVerify,
+			Usage: "Whether to skip TLS verification when connecting to the S3 endpoint.",
+		},
+		&cli.StringFlag{
+			Name:  mimirSSEKMSKeyID,
+			Usage: "SSE KMS Key ID for use with S3-compatible storages.",
+		},
+		&cli.StringFlag{
+			Name:  mimirSSEAlgorithm,
+			Usage: "SSE algorithm for use with S3-compatible storages.",
 		},
 	}
 )
@@ -468,7 +647,7 @@ var (
 			Name: vmNativeFilterMatch,
 			Usage: "Time series selector to match series for export. For example, select {instance!=\"localhost\"} will " +
 				"match all series with \"instance\" label different to \"localhost\".\n" +
-				" See more details here https://github.com/VictoriaMetrics/VictoriaMetrics#how-to-export-data-in-native-format",
+				" See more details here https://docs.victoriametrics.com/victoriametrics/single-server-victoriametrics/#how-to-export-data-in-native-format",
 			Value: `{__name__!=""}`,
 		},
 		&cli.StringFlag{
@@ -598,7 +777,7 @@ var (
 			Name:  vmExtraLabel,
 			Value: nil,
 			Usage: "Extra labels, that will be added to imported timeseries. In case of collision, label value defined by flag" +
-				"will have priority. Flag can be set multiple times, to add few additional labels.",
+				" will have priority. Flag can be set multiple times, to add few additional labels.",
 		},
 		&cli.Int64Flag{
 			Name: vmRateLimit,
@@ -625,8 +804,8 @@ var (
 		&cli.BoolFlag{
 			Name: vmNativeDisableBinaryProtocol,
 			Usage: "Whether to use https://docs.victoriametrics.com/victoriametrics/single-server-victoriametrics/#how-to-export-data-in-json-line-format " +
-				"instead of https://docs.victoriametrics.com/victoriametrics/single-server-victoriametrics/#how-to-export-data-in-native-format API." +
-				"Binary export/import API protocol implies less network and resource usage, as it transfers compressed binary data blocks." +
+				"instead of https://docs.victoriametrics.com/victoriametrics/single-server-victoriametrics/#how-to-export-data-in-native-format API. " +
+				"Binary export/import API protocol implies less network and resource usage, as it transfers compressed binary data blocks. " +
 				"Non-binary export/import API is less efficient, but supports deduplication if it is configured on vm-native-src-addr side.",
 			Value: false,
 		},

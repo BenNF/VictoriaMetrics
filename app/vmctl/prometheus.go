@@ -1,22 +1,35 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"log"
+	"strings"
 	"sync"
 
+	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
+
+	"github.com/VictoriaMetrics/metrics"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmctl/barpool"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmctl/prometheus"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmctl/vm"
 )
 
+// Runner is an interface for fetching and reading
+// snapshot blocks
+type Runner interface {
+	Explore() ([]tsdb.BlockReader, error)
+	Read(context.Context, tsdb.BlockReader) (*prometheus.CloseableSeriesSet, error)
+}
+
 type prometheusProcessor struct {
-	// prometheus client fetches and reads
+	// Runner fetches and reads
 	// snapshot blocks
-	cl *prometheus.Client
+	cl Runner
 	// importer performs import requests
 	// for timeseries data returned from
 	// snapshot blocks
@@ -30,21 +43,21 @@ type prometheusProcessor struct {
 	isVerbose bool
 }
 
-func (pp *prometheusProcessor) run() error {
+func (pp *prometheusProcessor) run(ctx context.Context) error {
 	blocks, err := pp.cl.Explore()
 	if err != nil {
-		return fmt.Errorf("explore failed: %s", err)
+		return fmt.Errorf("explore failed: %w", err)
 	}
 	if len(blocks) < 1 {
 		return fmt.Errorf("found no blocks to import")
 	}
 	question := fmt.Sprintf("Found %d blocks to import. Continue?", len(blocks))
-	if !prompt(question) {
+	if !prompt(ctx, question) {
 		return nil
 	}
 
-	if err := pp.processBlocks(blocks); err != nil {
-		return fmt.Errorf("migration failed: %s", err)
+	if err := pp.processBlocks(ctx, blocks); err != nil {
+		return fmt.Errorf("migration failed: %w", err)
 	}
 
 	log.Println("Import finished!")
@@ -52,27 +65,33 @@ func (pp *prometheusProcessor) run() error {
 	return nil
 }
 
-func (pp *prometheusProcessor) do(b tsdb.BlockReader) error {
-	ss, err := pp.cl.Read(b)
+func (pp *prometheusProcessor) do(ctx context.Context, b tsdb.BlockReader) error {
+	css, err := pp.cl.Read(ctx, b)
 	if err != nil {
-		return fmt.Errorf("failed to read block: %s", err)
+		return fmt.Errorf("failed to read block: %w", err)
 	}
+	defer func() {
+		if err := css.Close(); err != nil {
+			log.Printf("cannot close SeriesSet for block: %q : %s\n", b.Meta().ULID, err)
+		}
+	}()
+	ss := css.SeriesSet
 	var it chunkenc.Iterator
 	for ss.Next() {
 		var name string
-		var labels []vm.LabelPair
+		var labelPairs []vm.LabelPair
 		series := ss.At()
 
-		for _, label := range series.Labels() {
+		series.Labels().Range(func(label labels.Label) {
 			if label.Name == "__name__" {
 				name = label.Value
-				continue
+				return
 			}
-			labels = append(labels, vm.LabelPair{
-				Name:  label.Name,
-				Value: label.Value,
+			labelPairs = append(labelPairs, vm.LabelPair{
+				Name:  strings.Clone(label.Name),
+				Value: strings.Clone(label.Value),
 			})
-		}
+		})
 		if name == "" {
 			return fmt.Errorf("failed to find `__name__` label in labelset for block %v", b.Meta().ULID)
 		}
@@ -98,7 +117,7 @@ func (pp *prometheusProcessor) do(b tsdb.BlockReader) error {
 		}
 		ts := vm.TimeSeries{
 			Name:       name,
-			LabelPairs: labels,
+			LabelPairs: labelPairs,
 			Timestamps: timestamps,
 			Values:     values,
 		}
@@ -109,7 +128,8 @@ func (pp *prometheusProcessor) do(b tsdb.BlockReader) error {
 	return ss.Err()
 }
 
-func (pp *prometheusProcessor) processBlocks(blocks []tsdb.BlockReader) error {
+func (pp *prometheusProcessor) processBlocks(ctx context.Context, blocks []tsdb.BlockReader) error {
+	promBlocksTotal.Add(len(blocks))
 	bar := barpool.AddWithTemplate(fmt.Sprintf(barTpl, "Processing blocks"), len(blocks))
 	if err := barpool.Start(); err != nil {
 		return err
@@ -121,28 +141,34 @@ func (pp *prometheusProcessor) processBlocks(blocks []tsdb.BlockReader) error {
 	pp.im.ResetStats()
 
 	var wg sync.WaitGroup
-	wg.Add(pp.cc)
-	for i := 0; i < pp.cc; i++ {
-		go func() {
-			defer wg.Done()
+	for range pp.cc {
+		wg.Go(func() {
 			for br := range blockReadersCh {
-				if err := pp.do(br); err != nil {
-					errCh <- fmt.Errorf("read failed for block %q: %s", br.Meta().ULID, err)
+				if err := pp.do(ctx, br); err != nil {
+					promErrorsTotal.Inc()
+					errCh <- fmt.Errorf("cannot read block %q: %w", br.Meta().ULID, err)
 					return
 				}
+				if cb, ok := br.(io.Closer); ok {
+					if err := cb.Close(); err != nil {
+						errCh <- fmt.Errorf("cannot close block: %q: %w", br.Meta().ULID, err)
+					}
+				}
+				promBlocksProcessed.Inc()
 				bar.Increment()
 			}
-		}()
+		})
 	}
 	// any error breaks the import
 	for _, br := range blocks {
 		select {
 		case promErr := <-errCh:
 			close(blockReadersCh)
-			return fmt.Errorf("prometheus error: %s", promErr)
+			return fmt.Errorf("prometheus error: %w", promErr)
 		case vmErr := <-pp.im.Errors():
 			close(blockReadersCh)
-			return fmt.Errorf("import process failed: %s", wrapErr(vmErr, pp.isVerbose))
+			promErrorsTotal.Inc()
+			return fmt.Errorf("import process failed: %w", wrapErr(vmErr, pp.isVerbose))
 		case blockReadersCh <- br:
 		}
 	}
@@ -155,12 +181,19 @@ func (pp *prometheusProcessor) processBlocks(blocks []tsdb.BlockReader) error {
 	// drain import errors channel
 	for vmErr := range pp.im.Errors() {
 		if vmErr.Err != nil {
-			return fmt.Errorf("import process failed: %s", wrapErr(vmErr, pp.isVerbose))
+			promErrorsTotal.Inc()
+			return fmt.Errorf("import process failed: %w", wrapErr(vmErr, pp.isVerbose))
 		}
 	}
 	for err := range errCh {
-		return fmt.Errorf("import process failed: %s", err)
+		return fmt.Errorf("import process failed: %w", err)
 	}
 
 	return nil
 }
+
+var (
+	promBlocksTotal     = metrics.NewCounter(`vmctl_prometheus_migration_blocks_total`)
+	promBlocksProcessed = metrics.NewCounter(`vmctl_prometheus_migration_blocks_processed`)
+	promErrorsTotal     = metrics.NewCounter(`vmctl_prometheus_migration_errors_total`)
+)

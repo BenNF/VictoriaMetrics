@@ -1,12 +1,14 @@
 package httpserver
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	_ "embed"
 	"errors"
 	"flag"
 	"fmt"
+	"html"
 	"io"
 	"log"
 	"net"
@@ -62,9 +64,10 @@ var (
 	connTimeout                 = flag.Duration("http.connTimeout", 2*time.Minute, "Incoming connections to -httpListenAddr are closed after the configured timeout. "+
 		"This may help evenly spreading load among a cluster of services behind TCP-level load balancer. Zero value disables closing of incoming connections")
 
-	headerHSTS         = flag.String("http.header.hsts", "", "Value for 'Strict-Transport-Security' header, recommended: 'max-age=31536000; includeSubDomains'")
-	headerFrameOptions = flag.String("http.header.frameOptions", "", "Value for 'X-Frame-Options' header")
-	headerCSP          = flag.String("http.header.csp", "", `Value for 'Content-Security-Policy' header, recommended: "default-src 'self'"`)
+	headerHSTS                  = flag.String("http.header.hsts", "", "Value for 'Strict-Transport-Security' header, recommended: 'max-age=31536000; includeSubDomains'")
+	headerFrameOptions          = flag.String("http.header.frameOptions", "", "Value for 'X-Frame-Options' header")
+	headerCSP                   = flag.String("http.header.csp", "", `Value for 'Content-Security-Policy' header, recommended: "default-src 'self'"`)
+	headerDisableServerHostname = flag.Bool("http.header.disableServerHostname", false, "Whether to disable 'X-Server-Hostname' header in HTTP responses")
 
 	disableCORS = flag.Bool("http.disableCORS", false, `Disable CORS for all origins (*)`)
 )
@@ -164,7 +167,7 @@ func serveWithListener(addr string, ln net.Listener, rh RequestHandler, disableB
 		// Do not set ReadTimeout and WriteTimeout here,
 		// since these timeouts must be controlled by request handlers.
 
-		ErrorLog: logger.StdErrorLogger(),
+		ErrorLog: log.New(&tlsErrorSkipLogger{}, "", 0),
 	}
 	s.s.SetKeepAlivesEnabled(!*disableKeepAlive)
 	if *connTimeout > 0 {
@@ -226,15 +229,13 @@ func Stop(addrs []string) error {
 		if addr == "" {
 			continue
 		}
-		wg.Add(1)
-		go func(addr string) {
+		wg.Go(func() {
 			if err := stop(addr); err != nil {
 				errGlobalLock.Lock()
 				errGlobal = err
 				errGlobalLock.Unlock()
 			}
-			wg.Done()
-		}(addr)
+		})
 	}
 	wg.Wait()
 
@@ -274,7 +275,14 @@ func stop(addr string) error {
 }
 
 var gzipHandlerWrapper = func() func(http.Handler) http.HandlerFunc {
-	hw, err := gzhttp.NewWrapper(gzhttp.CompressionLevel(1))
+	hw, err := gzhttp.NewWrapper(
+		gzhttp.CompressionLevel(1),
+
+		// Prefer gzip over zstd compression if the client supports both methods
+		// because some intermediate proxies improperly handle zstd-compressed responses.
+		// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/10535
+		gzhttp.PreferZstd(false),
+	)
 	if err != nil {
 		panic(fmt.Errorf("BUG: cannot initialize gzip http wrapper: %w", err))
 	}
@@ -322,7 +330,9 @@ func handlerWrapper(w http.ResponseWriter, r *http.Request, rh RequestHandler) {
 	if *headerCSP != "" {
 		h.Add("Content-Security-Policy", *headerCSP)
 	}
-	h.Add("X-Server-Hostname", hostname)
+	if !*headerDisableServerHostname {
+		h.Add("X-Server-Hostname", hostname)
+	}
 	requestsTotal.Inc()
 	if whetherToCloseConn(r) {
 		connTimeoutClosedConns.Inc()
@@ -349,6 +359,12 @@ func handlerWrapper(w http.ResponseWriter, r *http.Request, rh RequestHandler) {
 		}
 		path = path[len(prefix)-1:]
 		r.URL.Path = path
+	}
+
+	if r.Method == http.MethodOptions {
+		EnableCORS(w, r)
+		w.WriteHeader(http.StatusNoContent)
+		return
 	}
 
 	w = &responseWriterWithAbort{
@@ -385,10 +401,7 @@ func builtinRoutesHandler(s *server, r *http.Request, w http.ResponseWriter, rh 
 		// Return non-OK response during grace period before shutting down the server.
 		// Load balancers must notify these responses and re-route new requests to other servers.
 		// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/463 .
-		d := time.Until(time.Unix(0, deadline))
-		if d < 0 {
-			d = 0
-		}
+		d := max(time.Until(time.Unix(0, deadline)), 0)
 		errMsg := fmt.Sprintf("The server is in delayed shutdown mode, which will end in %.3fs", d.Seconds())
 		http.Error(w, errMsg, http.StatusServiceUnavailable)
 		return true
@@ -508,6 +521,8 @@ func EnableCORS(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "*")
+	w.Header().Set("Access-Control-Allow-Headers", "*")
 }
 
 func pprofHandler(profileName string, w http.ResponseWriter, r *http.Request) {
@@ -617,6 +632,13 @@ func (rwa *responseWriterWithAbort) Flush() {
 	flusher.Flush()
 }
 
+// Unwrap returns the original ResponseWriter wrapped by rwa.
+//
+// This is needed for the net/http.ResponseController - see https://pkg.go.dev/net/http#NewResponseController
+func (rwa *responseWriterWithAbort) Unwrap() http.ResponseWriter {
+	return rwa.ResponseWriter
+}
+
 // abort aborts the client connection associated with rwa.
 //
 // The last http chunk in the response stream is intentionally written incorrectly,
@@ -668,7 +690,11 @@ func Errorf(w http.ResponseWriter, r *http.Request, format string, args ...any) 
 	if rwa, ok := w.(*responseWriterWithAbort); ok && rwa.sentHeaders {
 		// HTTP status code has been already sent to client, so it cannot be sent again.
 		// Just write errStr to the response and abort the client connection, so the client could notice the error.
-		fmt.Fprintf(w, "\n%s\n", errStr)
+		//
+		// HTML-escape the errStr in order to protect from possible XSS, since the errStr may contain user input.
+		errStrEscaped := html.EscapeString(errStr)
+
+		fmt.Fprintf(w, "\n%s\n", errStrEscaped)
 		rwa.abort()
 		return
 	}
@@ -783,4 +809,15 @@ func LogError(req *http.Request, errStr string) {
 	uri := GetRequestURI(req)
 	remoteAddr := GetQuotedRemoteAddr(req)
 	logger.Errorf("uri: %s, remote address: %q: %s", uri, remoteAddr, errStr)
+}
+
+type tlsErrorSkipLogger struct{}
+
+func (*tlsErrorSkipLogger) Write(p []byte) (int, error) {
+	// skip common health check errors produced by Kubernetes and other tools
+	if bytes.Contains(p, []byte("TLS handshake error")) &&
+		(bytes.Contains(p, []byte("EOF")) || bytes.Contains(p, []byte("connection reset by peer"))) {
+		return len(p), nil
+	}
+	return logger.StdErrorLogger().Writer().Write(p)
 }

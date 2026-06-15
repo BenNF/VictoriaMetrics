@@ -3,6 +3,7 @@ package notifier
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,7 +14,6 @@ import (
 	"github.com/VictoriaMetrics/metrics"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/vmalertutil"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/httputil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promauth"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promrelabel"
@@ -86,6 +86,11 @@ func (am *AlertManager) Send(ctx context.Context, alerts []Alert, alertLabels []
 	err := am.send(ctx, alerts, alertLabels, headers)
 	am.metrics.alertsSendDuration.UpdateDuration(startTime)
 	if err != nil {
+		// the context can be cancelled on graceful shutdown
+		// or on group update. So no need to handle the error as usual.
+		if errors.Is(err, context.Canceled) {
+			return nil
+		}
 		am.metrics.alertsSendErrors.Add(len(alerts))
 		am.lastError = err.Error()
 	} else {
@@ -166,11 +171,6 @@ const alertManagerPath = "/api/v2/alerts"
 func NewAlertManager(alertManagerURL string, fn AlertURLGenerator, authCfg promauth.HTTPClientConfig,
 	relabelCfg *promrelabel.ParsedConfigs, timeout time.Duration,
 ) (*AlertManager, error) {
-
-	if err := httputil.CheckURL(alertManagerURL); err != nil {
-		return nil, fmt.Errorf("invalid alertmanager URL: %w", err)
-	}
-
 	tls := &promauth.TLSConfig{}
 	if authCfg.TLSConfig != nil {
 		tls = authCfg.TLSConfig
@@ -191,7 +191,7 @@ func NewAlertManager(alertManagerURL string, fn AlertURLGenerator, authCfg proma
 	}
 
 	aCfg, err := vmalertutil.AuthConfig(
-		vmalertutil.WithBasicAuth(ba.Username, ba.Password.String(), ba.PasswordFile),
+		vmalertutil.WithBasicAuth(ba.Username, ba.UsernameFile, ba.Password.String(), ba.PasswordFile),
 		vmalertutil.WithBearer(authCfg.BearerToken.String(), authCfg.BearerTokenFile),
 		vmalertutil.WithOAuth(oauth.ClientID, oauth.ClientSecret.String(), oauth.ClientSecretFile, oauth.TokenURL, strings.Join(oauth.Scopes, ";"), oauth.EndpointParams),
 		vmalertutil.WithHeaders(strings.Join(authCfg.Headers, "^^")),

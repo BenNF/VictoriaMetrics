@@ -9,13 +9,13 @@ import (
 )
 
 func TestCache(t *testing.T) {
-	sizeMaxBytes := 64 * 1024
+	sizeMaxBytes := uint64(64 * 1024)
 	// Multiply sizeMaxBytes by the square of available CPU cores
 	// in order to get proper distribution of sizes between cache shards.
 	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/2204
 	cpus := cgroup.AvailableCPUs()
-	sizeMaxBytes *= cpus * cpus
-	getMaxSize := func() int {
+	sizeMaxBytes *= uint64(cpus * cpus)
+	getMaxSize := func() uint64 {
 		return sizeMaxBytes
 	}
 	c := NewCache(getMaxSize)
@@ -26,22 +26,30 @@ func TestCache(t *testing.T) {
 	if n := c.SizeMaxBytes(); n != sizeMaxBytes {
 		t.Fatalf("unexpected SizeMaxBytes(); got %d; want %d", n, sizeMaxBytes)
 	}
+	if n := c.Resets(); n != 0 {
+		t.Fatalf("unexpected Resets(); got %d; want %d", n, 0)
+	}
 	k := "foobar"
 	var e testEntry
+	keySize := uint64(len(k))
 	entrySize := e.SizeBytes()
+	keyEntrySize := keySize + entrySize
 	// Put a single entry into cache
 	c.PutEntry(k, &e)
 	if n := c.Len(); n != 1 {
 		t.Fatalf("unexpected number of items in the cache; got %d; want %d", n, 1)
 	}
-	if n := c.SizeBytes(); n != entrySize {
-		t.Fatalf("unexpected SizeBytes(); got %d; want %d", n, entrySize)
+	if n := c.SizeBytes(); n != keyEntrySize {
+		t.Fatalf("unexpected SizeBytes(); got %d; want %d", n, keyEntrySize)
 	}
 	if n := c.Requests(); n != 0 {
 		t.Fatalf("unexpected number of requests; got %d; want %d", n, 0)
 	}
 	if n := c.Misses(); n != 0 {
 		t.Fatalf("unexpected number of misses; got %d; want %d", n, 0)
+	}
+	if n := c.Resets(); n != 0 {
+		t.Fatalf("unexpected Resets(); got %d; want %d", n, 0)
 	}
 	// Obtain this entry from the cache
 	if e1 := c.GetEntry(k); e1 != &e {
@@ -53,6 +61,9 @@ func TestCache(t *testing.T) {
 	if n := c.Misses(); n != 0 {
 		t.Fatalf("unexpected number of misses; got %d; want %d", n, 0)
 	}
+	if n := c.Resets(); n != 0 {
+		t.Fatalf("unexpected Resets(); got %d; want %d", n, 0)
+	}
 	// Obtain non-existing entry from the cache
 	if e1 := c.GetEntry("non-existing-key"); e1 != nil {
 		t.Fatalf("unexpected non-nil block obtained for non-existing key: %v", e1)
@@ -63,10 +74,13 @@ func TestCache(t *testing.T) {
 	if n := c.Misses(); n != 1 {
 		t.Fatalf("unexpected number of misses; got %d; want %d", n, 1)
 	}
+	if n := c.Resets(); n != 0 {
+		t.Fatalf("unexpected Resets(); got %d; want %d", n, 0)
+	}
 	// Store the entry again.
 	c.PutEntry(k, &e)
-	if n := c.SizeBytes(); n != entrySize {
-		t.Fatalf("unexpected SizeBytes(); got %d; want %d", n, entrySize)
+	if n := c.SizeBytes(); n != keyEntrySize {
+		t.Fatalf("unexpected SizeBytes(); got %d; want %d", n, keyEntrySize)
 	}
 	if e1 := c.GetEntry(k); e1 != &e {
 		t.Fatalf("unexpected entry obtained; got %v; want %v", e1, &e)
@@ -77,17 +91,38 @@ func TestCache(t *testing.T) {
 	if n := c.Misses(); n != 1 {
 		t.Fatalf("unexpected number of misses; got %d; want %d", n, 1)
 	}
+	if n := c.Resets(); n != 0 {
+		t.Fatalf("unexpected Resets(); got %d; want %d", n, 0)
+	}
 
 	// Manually clean the cache. The entry shouldn't be deleted because it was recently accessed.
 	c.cleanByTimeout()
-	if n := c.SizeBytes(); n != entrySize {
-		t.Fatalf("unexpected SizeBytes(); got %d; want %d", n, entrySize)
+	if n := c.SizeBytes(); n != keyEntrySize {
+		t.Fatalf("unexpected SizeBytes(); got %d; want %d", n, keyEntrySize)
+	}
+
+	// Reset cache.
+	c.Reset()
+	if n := c.SizeMaxBytes(); n != sizeMaxBytes {
+		t.Fatalf("unexpected SizeMaxBytes(); got %d; want %d", n, sizeMaxBytes)
+	}
+	if n := c.SizeBytes(); n != 0 {
+		t.Fatalf("unexpected SizeBytes(); got %d; want %d", n, 0)
+	}
+	if n := c.Requests(); n != 3 {
+		t.Fatalf("unexpected number of requests; got %d; want %d", n, 0)
+	}
+	if n := c.Misses(); n != 1 {
+		t.Fatalf("unexpected number of misses; got %d; want %d", n, 0)
+	}
+	if n := c.Resets(); n != 1 {
+		t.Fatalf("unexpected Resets(); got %d; want %d", n, 1)
 	}
 }
 
 func TestCacheConcurrentAccess(_ *testing.T) {
-	const sizeMaxBytes = 16 * 1024 * 1024
-	getMaxSize := func() int {
+	const sizeMaxBytes = uint64(16 * 1024 * 1024)
+	getMaxSize := func() uint64 {
 		return sizeMaxBytes
 	}
 	c := NewCache(getMaxSize)
@@ -95,18 +130,16 @@ func TestCacheConcurrentAccess(_ *testing.T) {
 
 	workers := 5
 	var wg sync.WaitGroup
-	wg.Add(workers)
-	for i := 0; i < workers; i++ {
-		go func(worker int) {
-			defer wg.Done()
+	for worker := range workers {
+		wg.Go(func() {
 			testCacheSetGet(c, worker)
-		}(i)
+		})
 	}
 	wg.Wait()
 }
 
 func testCacheSetGet(c *Cache, worker int) {
-	for i := 0; i < 1000; i++ {
+	for i := range 1000 {
 		e := testEntry{}
 		k := fmt.Sprintf("key_%d_%d", worker, i)
 		c.PutEntry(k, &e)
@@ -121,6 +154,6 @@ func testCacheSetGet(c *Cache, worker int) {
 
 type testEntry struct{}
 
-func (tb *testEntry) SizeBytes() int {
+func (tb *testEntry) SizeBytes() uint64 {
 	return 42
 }

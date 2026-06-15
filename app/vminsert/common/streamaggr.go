@@ -55,7 +55,7 @@ var (
 	deduplicator *streamaggr.Deduplicator
 )
 
-// CheckStreamAggrConfig checks config pointed by -stramaggr.config
+// CheckStreamAggrConfig checks config pointed by -streamaggr.config
 func CheckStreamAggrConfig() error {
 	if *streamAggrConfig == "" {
 		return nil
@@ -111,9 +111,7 @@ func InitStreamAggr() {
 	saCfgTimestamp.Set(fasttime.UnixTimestamp())
 
 	// Start config reloader.
-	saCfgReloaderWG.Add(1)
-	go func() {
-		defer saCfgReloaderWG.Done()
+	saCfgReloaderWG.Go(func() {
 		for {
 			select {
 			case <-sighupCh:
@@ -122,7 +120,7 @@ func InitStreamAggr() {
 			}
 			reloadStreamAggrConfig()
 		}
-	}()
+	})
 }
 
 func reloadStreamAggrConfig() {
@@ -285,7 +283,7 @@ func pushAggregateSeries(tss []prompb.TimeSeries) {
 	}
 	// There is no need in limiting the number of concurrent calls to vmstorage.AddRows() here,
 	// since the number of concurrent pushAggregateSeries() calls should be already limited by lib/streamaggr.
-	if err := vmstorage.AddRows(ctx.mrs); err != nil {
+	if err := vmstorage.VMInsertAPI.WriteRows(ctx.mrs); err != nil {
 		logger.Errorf("cannot flush aggregate series: %s", err)
 	}
 }

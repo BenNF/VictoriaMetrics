@@ -12,6 +12,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmctl/auth"
+	"github.com/VictoriaMetrics/metrics"
+
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmctl/backoff"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmctl/barpool"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmctl/limiter"
@@ -25,6 +28,8 @@ type Config struct {
 	//   --httpListenAddr value for single node version
 	//   --httpListenAddr value of vmselect  component for cluster version
 	Addr string
+
+	AuthCfg *auth.Config
 	// Transport allows specifying custom http.Transport
 	Transport *http.Transport
 	// Concurrency defines number of worker
@@ -38,10 +43,6 @@ type Config struct {
 	// BatchSize defines how many samples
 	// importer collects before sending the import request
 	BatchSize int
-	// User name for basic auth
-	User string
-	// Password for basic auth
-	Password string
 	// SignificantFigures defines the number of significant figures to leave
 	// in metric values before importing.
 	// Zero value saves all the significant decimal places
@@ -63,11 +64,10 @@ type Config struct {
 // see https://docs.victoriametrics.com/victoriametrics/single-server-victoriametrics/#how-to-import-time-series-data
 type Importer struct {
 	addr       string
+	authCfg    *auth.Config
 	client     *http.Client
 	importPath string
 	compress   bool
-	user       string
-	password   string
 
 	close  chan struct{}
 	input  chan *TimeSeries
@@ -80,6 +80,12 @@ type Importer struct {
 
 	s       *stats
 	backoff *backoff.Backoff
+
+	importRequestsTotal       *metrics.Counter
+	importRequestsErrorsTotal *metrics.Counter
+	importSamplesTotal        *metrics.Counter
+	importBytesTotal          *metrics.Counter
+	importDuration            *metrics.Histogram
 }
 
 // ResetStats resets im stats.
@@ -140,31 +146,34 @@ func NewImporter(ctx context.Context, cfg Config) (*Importer, error) {
 		client:     client,
 		importPath: importPath,
 		compress:   cfg.Compress,
-		user:       cfg.User,
-		password:   cfg.Password,
+		authCfg:    cfg.AuthCfg,
 		rl:         limiter.NewLimiter(cfg.RateLimit),
 		close:      make(chan struct{}),
 		input:      make(chan *TimeSeries, cfg.Concurrency*4),
 		errors:     make(chan *ImportError, cfg.Concurrency),
 		backoff:    cfg.Backoff,
+
+		importRequestsTotal:       metrics.GetOrCreateCounter(`vmctl_importer_requests_total`),
+		importRequestsErrorsTotal: metrics.GetOrCreateCounter(`vmctl_importer_request_errors_total`),
+		importSamplesTotal:        metrics.GetOrCreateCounter(`vmctl_importer_samples_total`),
+		importBytesTotal:          metrics.GetOrCreateCounter(`vmctl_importer_bytes_total`),
+		importDuration:            metrics.GetOrCreateHistogram(`vmctl_importer_request_duration_seconds`),
 	}
 	if err := im.Ping(); err != nil {
-		return nil, fmt.Errorf("ping to %q failed: %s", addr, err)
+		return nil, fmt.Errorf("ping to %q failed: %w", addr, err)
 	}
 
 	if cfg.BatchSize < 1 {
 		cfg.BatchSize = 1e5
 	}
 
-	im.wg.Add(int(cfg.Concurrency))
-	for i := 0; i < int(cfg.Concurrency); i++ {
+	for i := range int(cfg.Concurrency) {
 		pbPrefix := fmt.Sprintf(`{{ green "VM worker %d:" }}`, i)
 		bar := barpool.AddWithTemplate(pbPrefix+pbTpl, 0)
 
-		go func(bar barpool.Bar) {
-			defer im.wg.Done()
+		im.wg.Go(func() {
 			im.startWorker(ctx, bar, cfg.BatchSize, cfg.SignificantFigures, cfg.RoundDigits)
-		}(bar)
+		})
 	}
 	im.ResetStats()
 	return im, nil
@@ -277,7 +286,7 @@ func (im *Importer) flush(ctx context.Context, b []*TimeSeries) error {
 	retryableFunc := func() error { return im.Import(b) }
 	attempts, err := im.backoff.Retry(ctx, retryableFunc)
 	if err != nil {
-		return fmt.Errorf("import failed with %d retries: %s", attempts, err)
+		return fmt.Errorf("import failed with %d retries: %w", attempts, err)
 	}
 	im.s.Lock()
 	im.s.retries = attempts
@@ -290,10 +299,10 @@ func (im *Importer) Ping() error {
 	url := fmt.Sprintf("%s/health", im.addr)
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
-		return fmt.Errorf("cannot create request to %q: %s", im.addr, err)
+		return fmt.Errorf("cannot create request to %q: %w", im.addr, err)
 	}
-	if im.user != "" {
-		req.SetBasicAuth(im.user, im.password)
+	if im.authCfg != nil {
+		im.authCfg.SetHeaders(req, true)
 	}
 	resp, err := im.client.Do(req)
 	if err != nil {
@@ -313,13 +322,17 @@ func (im *Importer) Import(tsBatch []*TimeSeries) error {
 		return nil
 	}
 
+	startTime := time.Now()
+	im.importRequestsTotal.Inc()
+
 	pr, pw := io.Pipe()
 	req, err := http.NewRequest(http.MethodPost, im.importPath, pr)
 	if err != nil {
-		return fmt.Errorf("cannot create request to %q: %s", im.addr, err)
+		im.importRequestsErrorsTotal.Inc()
+		return fmt.Errorf("cannot create request to %q: %w", im.addr, err)
 	}
-	if im.user != "" {
-		req.SetBasicAuth(im.user, im.password)
+	if im.authCfg != nil {
+		im.authCfg.SetHeaders(req, true)
 	}
 	if im.compress {
 		req.Header.Set("Content-Encoding", "gzip")
@@ -335,7 +348,8 @@ func (im *Importer) Import(tsBatch []*TimeSeries) error {
 	if im.compress {
 		zw, err := gzip.NewWriterLevel(w, 1)
 		if err != nil {
-			return fmt.Errorf("unexpected error when creating gzip writer: %s", err)
+			im.importRequestsErrorsTotal.Inc()
+			return fmt.Errorf("unexpected error when creating gzip writer: %w", err)
 		}
 		w = zw
 	}
@@ -346,28 +360,38 @@ func (im *Importer) Import(tsBatch []*TimeSeries) error {
 	for _, ts := range tsBatch {
 		n, err := ts.write(bw)
 		if err != nil {
+			im.importRequestsErrorsTotal.Inc()
 			return fmt.Errorf("write err: %w", err)
 		}
 		totalBytes += n
 		totalSamples += len(ts.Values)
 	}
 	if err := bw.Flush(); err != nil {
+		im.importRequestsErrorsTotal.Inc()
 		return err
 	}
 	if closer, ok := w.(io.Closer); ok {
 		err := closer.Close()
 		if err != nil {
+			im.importRequestsErrorsTotal.Inc()
 			return err
 		}
 	}
 	if err := pw.Close(); err != nil {
+		im.importRequestsErrorsTotal.Inc()
 		return err
 	}
 
 	requestErr := <-errCh
 	if requestErr != nil {
+		im.importRequestsErrorsTotal.Inc()
+		im.importDuration.UpdateDuration(startTime)
 		return fmt.Errorf("import request error for %q: %w", im.addr, requestErr)
 	}
+
+	im.importSamplesTotal.Add(totalSamples)
+	im.importBytesTotal.Add(totalBytes)
+	im.importDuration.UpdateDuration(startTime)
 
 	im.s.Lock()
 	im.s.bytes += uint64(totalBytes)
@@ -384,7 +408,7 @@ var ErrBadRequest = errors.New("bad request")
 func (im *Importer) do(req *http.Request) error {
 	resp, err := im.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("unexpected error when performing request: %s", err)
+		return fmt.Errorf("unexpected error when performing request: %w", err)
 	}
 	defer func() {
 		_ = resp.Body.Close()
@@ -392,7 +416,7 @@ func (im *Importer) do(req *http.Request) error {
 	if resp.StatusCode != http.StatusNoContent {
 		body, err := io.ReadAll(resp.Body)
 		if err != nil {
-			return fmt.Errorf("failed to read response body for status code %d: %s", resp.StatusCode, err)
+			return fmt.Errorf("failed to read response body for status code %d: %w", resp.StatusCode, err)
 		}
 		if resp.StatusCode == http.StatusBadRequest {
 			return fmt.Errorf("%w: unexpected response code %d: %s", ErrBadRequest, resp.StatusCode, string(body))

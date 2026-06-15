@@ -27,6 +27,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmagent/promremotewrite"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmagent/remotewrite"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmagent/vmimport"
+	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmagent/zabbixconnector"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/buildinfo"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
@@ -82,6 +83,9 @@ var (
 	maxLabelsPerTimeseries = flag.Int("maxLabelsPerTimeseries", 0, "The maximum number of labels per time series to be accepted. Series with superfluous labels are ignored. In this case the vm_rows_ignored_total{reason=\"too_many_labels\"} metric at /metrics page is incremented")
 	maxLabelNameLen        = flag.Int("maxLabelNameLen", 0, "The maximum length of label names in the accepted time series. Series with longer label name are ignored. In this case the vm_rows_ignored_total{reason=\"too_long_label_name\"} metric at /metrics page is incremented")
 	maxLabelValueLen       = flag.Int("maxLabelValueLen", 0, "The maximum length of label values in the accepted time series. Series with longer label value are ignored. In this case the vm_rows_ignored_total{reason=\"too_long_label_value\"} metric at /metrics page is incremented")
+
+	enableMultitenancyViaHeaders = flag.Bool("enableMultitenancyViaHeaders", false, "Enables multitenancy via HTTP headers. "+
+		"See https://docs.victoriametrics.com/victoriametrics/vmagent/#multitenancy")
 )
 
 var (
@@ -114,6 +118,7 @@ func main() {
 	remotewrite.InitSecretFlags()
 	buildinfo.Init()
 	logger.Init()
+	opentelemetry.Init()
 	timeserieslimits.Init(*maxLabelsPerTimeseries, *maxLabelNameLen, *maxLabelValueLen)
 
 	if promscrape.IsDryRun() {
@@ -215,7 +220,7 @@ func getOpenTSDBHTTPInsertHandler() func(req *http.Request) error {
 	}
 	return func(req *http.Request) error {
 		path := strings.ReplaceAll(req.URL.Path, "//", "/")
-		at, err := getAuthTokenFromPath(path)
+		at, err := getAuthTokenFromPath(path, req.Header)
 		if err != nil {
 			return fmt.Errorf("cannot obtain auth token from path %q: %w", path, err)
 		}
@@ -223,8 +228,15 @@ func getOpenTSDBHTTPInsertHandler() func(req *http.Request) error {
 	}
 }
 
-func getAuthTokenFromPath(path string) (*auth.Token, error) {
-	p, err := httpserver.ParsePath(path)
+func parsePath(path string, header http.Header) (*httpserver.Path, error) {
+	if *enableMultitenancyViaHeaders {
+		return httpserver.ParsePathAndHeaders(path, header)
+	}
+	return httpserver.ParsePath(path)
+}
+
+func getAuthTokenFromPath(path string, header http.Header) (*auth.Token, error) {
+	p, err := parsePath(path, header)
 	if err != nil {
 		return nil, fmt.Errorf("cannot parse multitenant path: %w", err)
 	}
@@ -244,6 +256,7 @@ func requestHandler(w http.ResponseWriter, r *http.Request) bool {
 		}
 		w.Header().Add("Content-Type", "text/html; charset=utf-8")
 		fmt.Fprintf(w, "<h2>vmagent</h2>")
+		fmt.Fprintf(w, "Version %s<br>", buildinfo.Version)
 		fmt.Fprintf(w, "See docs at <a href='https://docs.victoriametrics.com/victoriametrics/vmagent/'>https://docs.victoriametrics.com/victoriametrics/vmagent/</a></br>")
 		fmt.Fprintf(w, "Useful endpoints:</br>")
 		httpserver.WriteAPIHelp(w, [][2]string{
@@ -349,6 +362,17 @@ func requestHandler(w http.ResponseWriter, r *http.Request) bool {
 			return true
 		}
 		firehose.WriteSuccessResponse(w, r)
+		return true
+	case "/zabbixconnector/api/v1/history":
+		zabbixconnectorHistoryRequests.Inc()
+		if err := zabbixconnector.InsertHandlerForHTTP(nil, r); err != nil {
+			zabbixconnectorHistoryErrors.Inc()
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprintf(w, `{"error":%q}`, err.Error())
+			return true
+		}
+		w.WriteHeader(http.StatusOK)
 		return true
 	case "/newrelic":
 		newrelicCheckRequest.Inc()
@@ -546,14 +570,15 @@ func requestHandler(w http.ResponseWriter, r *http.Request) bool {
 }
 
 func processMultitenantRequest(w http.ResponseWriter, r *http.Request, path string) bool {
-	p, err := httpserver.ParsePath(path)
+	p, err := parsePath(path, r.Header)
 	if err != nil {
 		// Cannot parse multitenant path. Skip it - probably it will be parsed later.
 		return false
 	}
 	if p.Prefix != "insert" {
-		httpserver.Errorf(w, r, `unsupported multitenant prefix: %q; expected "insert"`, p.Prefix)
-		return true
+		// processMultitenantRequest is called for all unmatched path variants,
+		// but we should try parsing only /insert prefixed to avoid catching all possible paths.
+		return false
 	}
 	at, err := auth.NewTokenPossibleMultitenant(p.AuthToken)
 	if err != nil {
@@ -643,6 +668,17 @@ func processMultitenantRequest(w http.ResponseWriter, r *http.Request, path stri
 			return true
 		}
 		firehose.WriteSuccessResponse(w, r)
+		return true
+	case "zabbixconnector/api/v1/history":
+		zabbixconnectorHistoryRequests.Inc()
+		if err := zabbixconnector.InsertHandlerForHTTP(at, r); err != nil {
+			zabbixconnectorHistoryErrors.Inc()
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprintf(w, `{"error":%q}`, err.Error())
+			return true
+		}
+		w.WriteHeader(http.StatusOK)
 		return true
 	case "newrelic":
 		newrelicCheckRequest.Inc()
@@ -764,6 +800,9 @@ var (
 
 	opentelemetryPushRequests = metrics.NewCounter(`vmagent_http_requests_total{path="/opentelemetry/v1/metrics", protocol="opentelemetry"}`)
 	opentelemetryPushErrors   = metrics.NewCounter(`vmagent_http_request_errors_total{path="/opentelemetry/v1/metrics", protocol="opentelemetry"}`)
+
+	zabbixconnectorHistoryRequests = metrics.NewCounter(`vmagent_http_requests_total{path="/zabbixconnector/api/v1/history", protocol="zabbixconnector"}`)
+	zabbixconnectorHistoryErrors   = metrics.NewCounter(`vmagent_http_request_errors_total{path="/zabbixconnector/api/v1/history", protocol="zabbixconnector"}`)
 
 	newrelicWriteRequests = metrics.NewCounter(`vm_http_requests_total{path="/newrelic/infra/v2/metrics/events/bulk", protocol="newrelic"}`)
 	newrelicWriteErrors   = metrics.NewCounter(`vm_http_request_errors_total{path="/newrelic/infra/v2/metrics/events/bulk", protocol="newrelic"}`)

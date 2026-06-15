@@ -144,6 +144,55 @@ func TestAuthKeyMetrics(t *testing.T) {
 	tstWithOutAuthKey("wrong", "wrong", 401)
 }
 
+func TestHandlerWrapperOptionsRequest(t *testing.T) {
+	handlerCalled := false
+	rh := func(_ http.ResponseWriter, _ *http.Request) bool {
+		handlerCalled = true
+		return true
+	}
+	headersToCheck := []string{"Access-Control-Allow-Origin", "Access-Control-Allow-Headers"}
+	f := func(t *testing.T, corsDisabled bool) {
+		t.Helper()
+		handlerCalled = false
+
+		origDisableCORS := *disableCORS
+		*disableCORS = corsDisabled
+		defer func() {
+			*disableCORS = origDisableCORS
+		}()
+
+		wantCORSHeaderValue := "*"
+		if corsDisabled {
+			wantCORSHeaderValue = ""
+		}
+		req := httptest.NewRequest(http.MethodOptions, "/api/v1/query_range", nil)
+		w := httptest.NewRecorder()
+
+		handlerWrapper(w, req, rh)
+
+		res := w.Result()
+		_ = res.Body.Close()
+
+		if res.StatusCode != http.StatusNoContent {
+			t.Fatalf("unexpected status code; (-%d;+%d)", http.StatusNoContent, res.StatusCode)
+		}
+		if handlerCalled {
+			t.Fatalf("request handler must not be called for OPTIONS requests")
+		}
+		for _, h := range headersToCheck {
+			got := res.Header.Get(h)
+			if wantCORSHeaderValue != got {
+				t.Fatalf("unexpected header: %s value: (-%s;+%s)", h, wantCORSHeaderValue, got)
+			}
+		}
+	}
+
+	// CORS disabled
+	f(t, false)
+	// CORS enabled
+	f(t, true)
+}
+
 func TestHandlerWrapper(t *testing.T) {
 	const hstsHeader = "foo"
 	const frameOptionsHeader = "bar"
@@ -178,5 +227,31 @@ func TestHandlerWrapper(t *testing.T) {
 	}
 	if got := h.Get("Content-Security-Policy"); got != cspHeader {
 		t.Fatalf("unexpected CSP header; got %q; want %q", got, cspHeader)
+	}
+	if got := h.Get("X-Server-Hostname"); got != hostname {
+		t.Fatalf("unexpected X-Server-Hostname header; got %q; want %q", got, hostname)
+	}
+}
+
+func TestHandlerWrapperDisableServerHostnameHeader(t *testing.T) {
+	origDisableServerHostname := *headerDisableServerHostname
+	*headerDisableServerHostname = true
+	defer func() {
+		*headerDisableServerHostname = origDisableServerHostname
+	}()
+
+	req, _ := http.NewRequest("GET", "/health", nil)
+
+	srv := &server{s: &http.Server{}}
+	w := &httptest.ResponseRecorder{}
+
+	handlerWrapper(w, req, func(w http.ResponseWriter, r *http.Request) bool {
+		return builtinRoutesHandler(srv, r, w, func(_ http.ResponseWriter, _ *http.Request) bool {
+			return true
+		})
+	})
+
+	if got := w.Header().Get("X-Server-Hostname"); got != "" {
+		t.Fatalf("unexpected X-Server-Hostname header; got %q; want empty value", got)
 	}
 }

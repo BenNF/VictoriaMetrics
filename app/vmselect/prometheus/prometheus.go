@@ -6,11 +6,13 @@ import (
 	"math"
 	"net/http"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/VictoriaMetrics/metrics"
 	"github.com/VictoriaMetrics/metricsql"
@@ -27,7 +29,6 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/httpserver"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/httputil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/memory"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/netutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/querytracer"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storage"
@@ -48,9 +49,6 @@ var (
 		"If set to true, the query model becomes closer to InfluxDB data model. If set to true, then -search.maxLookback and -search.maxStalenessInterval are ignored")
 	maxStepForPointsAdjustment = flag.Duration("search.maxStepForPointsAdjustment", time.Minute, "The maximum step when /api/v1/query_range handler adjusts "+
 		"points with timestamps closer than -search.latencyOffset to the current time. The adjustment is needed because such points may contain incomplete data")
-
-	maxUniqueTimeseries = flag.Int("search.maxUniqueTimeseries", 0, "The maximum number of unique time series, which can be selected during /api/v1/query and /api/v1/query_range queries. This option allows limiting memory usage. "+
-		"When set to zero, the limit is automatically calculated based on -search.maxConcurrentRequests (inversely proportional) and memory available to the process (proportional).")
 	maxFederateSeries       = flag.Int("search.maxFederateSeries", 1e6, "The maximum number of time series, which can be returned from /federate. This option allows limiting memory usage")
 	maxExportSeries         = flag.Int("search.maxExportSeries", 10e6, "The maximum number of time series, which can be returned from /api/v1/export* APIs. This option allows limiting memory usage")
 	maxTSDBStatusSeries     = flag.Int("search.maxTSDBStatusSeries", 10e6, "The maximum number of time series, which can be processed during the call to /api/v1/status/tsdb. This option allows limiting memory usage")
@@ -106,6 +104,11 @@ func PrettifyQuery(w http.ResponseWriter, r *http.Request) {
 	_ = bw.Flush()
 }
 
+const (
+	federateEscapeSchemeUnderscore = "underscore"
+	federateEscapeSchemeUTF8       = "utf-8"
+)
+
 // FederateHandler implements /federate . See https://prometheus.io/docs/prometheus/latest/federation/
 func FederateHandler(startTime time.Time, w http.ResponseWriter, r *http.Request) error {
 	defer federateDuration.UpdateDuration(startTime)
@@ -130,6 +133,21 @@ func FederateHandler(startTime time.Time, w http.ResponseWriter, r *http.Request
 		return fmt.Errorf("cannot fetch data for %q: %w", sq, err)
 	}
 
+	// add best-effort format negotiation
+	// modern version of Prometheus always set allow-utf-8 in order to properly parse utf-8 names and labels
+	// prometheus below v3 uses underscore escaping by default and it's the most common standard
+	var escapeScheme string
+	accept := r.Header.Get("Accept")
+	if len(accept) > 0 && strings.Contains(accept, "allow-utf-8") {
+		escapeScheme = federateEscapeSchemeUTF8
+	}
+	// try fallback to legacy underscore escaping if needed for Prometheus only,
+	// it's not widely used after Prometheus v3.0 release
+	// most of the Prometheus scrapers already use allow-utf-8 header
+	isPrometheus := strings.HasPrefix(r.UserAgent(), "Prometheus")
+	if len(escapeScheme) == 0 && isPrometheus {
+		escapeScheme = federateEscapeSchemeUnderscore
+	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	bw := bufferedwriter.Get(w)
 	defer bufferedwriter.Put(bw)
@@ -139,7 +157,7 @@ func FederateHandler(startTime time.Time, w http.ResponseWriter, r *http.Request
 			return err
 		}
 		bb := sw.getBuffer(workerID)
-		WriteFederate(bb, rs)
+		WriteFederate(bb, rs, escapeScheme)
 		return sw.maybeFlushBuffer(bb)
 	})
 	if err == nil {
@@ -173,6 +191,7 @@ func ExportCSVHandler(startTime time.Time, w http.ResponseWriter, r *http.Reques
 	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 	bw := bufferedwriter.Get(w)
 	defer bufferedwriter.Put(bw)
+	WriteExportCSVHeader(bw, fieldNames)
 	sw := newScalableWriter(bw)
 	writeCSVLine := func(xb *exportBlock, workerID uint) error {
 		if len(xb.timestamps) == 0 {
@@ -507,6 +526,7 @@ func DeleteHandler(startTime time.Time, r *http.Request) error {
 	if deletedCount > 0 {
 		promql.ResetRollupResultCache()
 	}
+	logger.Infof("/api/v1/admin/tsdb/delete_series has been called for %q. Deleted %d series.", sq.FiltersString(), deletedCount)
 	return nil
 }
 
@@ -527,6 +547,14 @@ func LabelValuesHandler(qt *querytracer.Tracer, startTime time.Time, labelName s
 		return err
 	}
 	sq := storage.NewSearchQuery(cp.start, cp.end, cp.filterss, *maxLabelsAPISeries)
+
+	if strings.HasPrefix(labelName, "U__") {
+		// This label seems to be Unicode-encoded according to the Prometheus spec.
+		// See https://prometheus.io/docs/prometheus/latest/querying/api/#querying-label-values
+		// Spec: https://github.com/prometheus/proposals/blob/main/proposals/0028-utf8.md
+		labelName = unescapePrometheusLabelName(labelName)
+	}
+
 	labelValues, err := netstorage.LabelValues(qt, labelName, sq, limit, cp.deadline)
 	if err != nil {
 		return fmt.Errorf("cannot obtain values for label %q: %w", labelName, err)
@@ -842,7 +870,7 @@ func QueryHandler(qt *querytracer.Tracer, startTime time.Time, w http.ResponseWr
 		End:                 start,
 		Step:                step,
 		MaxPointsPerSeries:  *maxPointsPerTimeseries,
-		MaxSeries:           GetMaxUniqueTimeSeries(),
+		MaxSeries:           0, // let vmstorage use maxUniqueTimeseries by default
 		QuotedRemoteAddr:    httpserver.GetQuotedRemoteAddr(r),
 		Deadline:            deadline,
 		MayCache:            mayCache,
@@ -953,7 +981,7 @@ func queryRangeHandler(qt *querytracer.Tracer, startTime time.Time, w http.Respo
 		End:                 end,
 		Step:                step,
 		MaxPointsPerSeries:  *maxPointsPerTimeseries,
-		MaxSeries:           GetMaxUniqueTimeSeries(),
+		MaxSeries:           0, // let vmstorage use maxUniqueTimeseries by default
 		QuotedRemoteAddr:    httpserver.GetQuotedRemoteAddr(r),
 		Deadline:            deadline,
 		MayCache:            mayCache,
@@ -1004,14 +1032,7 @@ func removeEmptyValuesAndTimeseries(tss []netstorage.Result) []netstorage.Result
 	dst := tss[:0]
 	for i := range tss {
 		ts := &tss[i]
-		hasNaNs := false
-		for _, v := range ts.Values {
-			if math.IsNaN(v) {
-				hasNaNs = true
-				break
-			}
-		}
-		if !hasNaNs {
+		if !slices.ContainsFunc(ts.Values, math.IsNaN) {
 			// Fast path: nothing to remove.
 			if len(ts.Values) > 0 {
 				dst = append(dst, *ts)
@@ -1219,11 +1240,7 @@ func getCommonParamsInternal(r *http.Request, startTime time.Time, requireNonEmp
 	if err != nil {
 		return nil, err
 	}
-	// Limit the `end` arg to the current time +2 days in the same way
-	// as it is limited during data ingestion.
-	// See https://github.com/VictoriaMetrics/VictoriaMetrics/blob/ea06d2fd3ccbbb6aa4480ab3b04f7b671408be2a/lib/storage/table.go#L378
-	// This should fix possible timestamp overflow - see https://github.com/VictoriaMetrics/VictoriaMetrics/issues/2669
-	maxTS := startTime.UnixNano()/1e6 + 2*24*3600*1000
+	maxTS := int64(math.MaxInt64 / 1_000_000)
 	if end > maxTS {
 		end = maxTS
 	}
@@ -1300,39 +1317,69 @@ func (sw *scalableWriter) flush() error {
 	return sw.bw.Flush()
 }
 
-var (
-	maxUniqueTimeseriesValueOnce sync.Once
-	maxUniqueTimeseriesValue     int
-)
-
-// InitMaxUniqueTimeseries init the max metrics limit calculated by available resources.
-// The calculation is split into calculateMaxUniqueTimeSeriesForResource for unit testing.
-func InitMaxUniqueTimeseries(maxConcurrentRequests int) {
-	maxUniqueTimeseriesValueOnce.Do(func() {
-		maxUniqueTimeseriesValue = *maxUniqueTimeseries
-		if maxUniqueTimeseriesValue <= 0 {
-			maxUniqueTimeseriesValue = calculateMaxUniqueTimeSeriesForResource(maxConcurrentRequests, memory.Remaining())
-		}
-	})
-}
-
-// calculateMaxUniqueTimeSeriesForResource calculate the max metrics limit calculated by available resources.
-func calculateMaxUniqueTimeSeriesForResource(maxConcurrentRequests, remainingMemory int) int {
-	if maxConcurrentRequests <= 0 {
-		// This line should NOT be reached unless the user has set an incorrect `search.maxConcurrentRequests`.
-		// In such cases, fallback to unlimited.
-		logger.Warnf("limiting -search.maxUniqueTimeseries to %v because -search.maxConcurrentRequests=%d.", 2e9, maxConcurrentRequests)
-		return 2e9
+// copied from https://github.com/prometheus/common/blob/adea6285c1c7447fcb7bfdeb6abfc6eff893e0a7/model/metric.go#L483
+// it's not possible to use direct import due to increased binary size
+func unescapePrometheusLabelName(name string) string {
+	// lower function taken from strconv.atoi.
+	lower := func(c byte) byte {
+		return c | ('x' - 'X')
+	}
+	if len(name) == 0 {
+		return name
+	}
+	escapedName, found := strings.CutPrefix(name, "U__")
+	if !found {
+		return name
 	}
 
-	// Calculate the max metrics limit for a single request in the worst-case concurrent scenario.
-	// The approximate size of 1 unique series that could occupy in the vmstorage is 200 bytes.
-	mts := remainingMemory / 200 / maxConcurrentRequests
-	logger.Infof("limiting -search.maxUniqueTimeseries to %d according to -search.maxConcurrentRequests=%d and remaining memory=%d bytes. To increase the limit, reduce -search.maxConcurrentRequests or increase memory available to the process.", mts, maxConcurrentRequests, remainingMemory)
-	return mts
-}
-
-// GetMaxUniqueTimeSeries returns the max metrics limit calculated by available resources.
-func GetMaxUniqueTimeSeries() int {
-	return maxUniqueTimeseriesValue
+	var unescaped strings.Builder
+TOP:
+	for i := 0; i < len(escapedName); i++ {
+		// All non-underscores are treated normally.
+		if escapedName[i] != '_' {
+			unescaped.WriteByte(escapedName[i])
+			continue
+		}
+		i++
+		if i >= len(escapedName) {
+			return name
+		}
+		// A double underscore is a single underscore.
+		if escapedName[i] == '_' {
+			unescaped.WriteByte('_')
+			continue
+		}
+		// We think we are in a UTF-8 code, process it.
+		var utf8Val uint
+		for j := 0; i < len(escapedName); j++ {
+			// This is too many characters for a utf8 value based on the MaxRune
+			// value of '\U0010FFFF'.
+			if j >= 6 {
+				return name
+			}
+			// Found a closing underscore, convert to a rune, check validity, and append.
+			if escapedName[i] == '_' {
+				utf8Rune := rune(utf8Val)
+				if !utf8.ValidRune(utf8Rune) {
+					return name
+				}
+				unescaped.WriteRune(utf8Rune)
+				continue TOP
+			}
+			r := lower(escapedName[i])
+			utf8Val *= 16
+			switch {
+			case r >= '0' && r <= '9':
+				utf8Val += uint(r) - '0'
+			case r >= 'a' && r <= 'f':
+				utf8Val += uint(r) - 'a' + 10
+			default:
+				return name
+			}
+			i++
+		}
+		// Didn't find closing underscore, invalid.
+		return name
+	}
+	return unescaped.String()
 }

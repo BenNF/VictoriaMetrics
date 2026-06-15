@@ -1,11 +1,8 @@
 @use "src/styles/variables" as *;
 
 .vm-explore-alert-group {
+  content-visibility: auto;
   width: 100%;
-  &:has(.vm-accordion-header_open) {
-    border: $border-divider;
-    border-radius: $border-radius-small;
-  }
 }
 
 .vm-explore-alerts.vm-modal {
@@ -17,6 +14,19 @@
   }
   .vm-modal-content {
     max-width: 90vw;
+  }
+}
+
+.vm-explore-alerts-load {
+  text-align: center;
+  color: var(--color-text-disabled);
+  button {
+    border: none;
+  }
+  &-before {
+    svg {
+      transform: rotate(180deg);
+    }
   }
 }
 

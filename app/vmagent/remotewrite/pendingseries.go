@@ -48,11 +48,7 @@ func newPendingSeries(fq *persistentqueue.FastQueue, isVMRemoteWrite *atomic.Boo
 	ps.wr.significantFigures = significantFigures
 	ps.wr.roundDigits = roundDigits
 	ps.stopCh = make(chan struct{})
-	ps.periodicFlusherWG.Add(1)
-	go func() {
-		defer ps.periodicFlusherWG.Done()
-		ps.periodicFlusher()
-	}()
+	ps.periodicFlusherWG.Go(ps.periodicFlusher)
 	return &ps
 }
 
@@ -214,6 +210,9 @@ func (wr *writeRequest) copyMetadata(dst, src *prompb.MetricMetadata) {
 	// Direct copy for non-string fields, which are safe by value.
 	dst.Type = src.Type
 	dst.Unit = src.Unit
+
+	dst.AccountID = src.AccountID
+	dst.ProjectID = src.ProjectID
 
 	// Pre-allocate memory for all string fields.
 	neededBufLen := len(src.MetricFamilyName) + len(src.Help)

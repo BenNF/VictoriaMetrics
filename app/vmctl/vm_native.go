@@ -9,6 +9,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/VictoriaMetrics/metrics"
+
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmctl/backoff"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmctl/barpool"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmctl/limiter"
@@ -53,14 +55,14 @@ func (p *vmNativeProcessor) run(ctx context.Context) error {
 
 	start, err := vmctlutil.ParseTime(p.filter.TimeStart)
 	if err != nil {
-		return fmt.Errorf("failed to parse %s, provided: %s, error: %w", vmNativeFilterTimeStart, p.filter.TimeStart, err)
+		return fmt.Errorf("failed to parse %s, provided: %s: %w", vmNativeFilterTimeStart, p.filter.TimeStart, err)
 	}
 
 	end := time.Now().In(start.Location())
 	if p.filter.TimeEnd != "" {
 		end, err = vmctlutil.ParseTime(p.filter.TimeEnd)
 		if err != nil {
-			return fmt.Errorf("failed to parse %s, provided: %s, error: %w", vmNativeFilterTimeEnd, p.filter.TimeEnd, err)
+			return fmt.Errorf("failed to parse %s, provided: %s: %w", vmNativeFilterTimeEnd, p.filter.TimeEnd, err)
 		}
 	}
 
@@ -79,15 +81,21 @@ func (p *vmNativeProcessor) run(ctx context.Context) error {
 			return fmt.Errorf("failed to get tenants: %w", err)
 		}
 		question := fmt.Sprintf("The following tenants were discovered: %s.\n Continue?", tenants)
-		if !prompt(question) {
+		if !prompt(ctx, question) {
 			return nil
 		}
+		migrationTenantsTotal.Set(uint64(len(tenants)))
 	}
 
 	for _, tenantID := range tenants {
 		err := p.runBackfilling(ctx, tenantID, ranges)
 		if err != nil {
-			return fmt.Errorf("migration failed: %s", err)
+			migrationErrorsTotal.Inc()
+			return fmt.Errorf("migration failed: %w", err)
+		}
+
+		if p.interCluster {
+			migrationTenantsProcessed.Inc()
 		}
 	}
 
@@ -149,13 +157,14 @@ func (p *vmNativeProcessor) runSingle(ctx context.Context, f native.Filter, srcU
 			}
 		default:
 		}
-		return fmt.Errorf("failed to write into %q: %s", p.dst.Addr, err)
+		return fmt.Errorf("failed to write into %q: %w", p.dst.Addr, err)
 	}
 
 	p.s.Lock()
 	p.s.bytes += uint64(written)
 	p.s.requests++
 	p.s.Unlock()
+	migrationBytesTransferredTotal.AddInt64(written)
 
 	if err := pw.Close(); err != nil {
 		return err
@@ -175,7 +184,7 @@ func (p *vmNativeProcessor) runBackfilling(ctx context.Context, tenantID string,
 
 	importAddr, err := vm.AddExtraLabelsToImportPath(importAddr, p.dst.ExtraLabels)
 	if err != nil {
-		return fmt.Errorf("failed to add labels to import path: %s", err)
+		return fmt.Errorf("failed to add labels to import path: %w", err)
 	}
 	dstURL := fmt.Sprintf("%s/%s", p.dst.Addr, importAddr)
 
@@ -199,7 +208,7 @@ func (p *vmNativeProcessor) runBackfilling(ctx context.Context, tenantID string,
 
 	var foundSeriesMsg string
 	var requestsToMake int
-	var metrics = map[string][][]time.Time{
+	var metricsMap = map[string][][]time.Time{
 		"": ranges,
 	}
 
@@ -211,11 +220,11 @@ func (p *vmNativeProcessor) runBackfilling(ctx context.Context, tenantID string,
 
 	if !p.disablePerMetricRequests {
 		format = fmt.Sprintf(nativeWithBackoffTpl, barPrefix)
-		metrics, err = p.explore(ctx, p.src, tenantID, ranges)
+		metricsMap, err = p.explore(ctx, p.src, tenantID, ranges)
 		if err != nil {
-			return fmt.Errorf("failed to explore metric names: %s", err)
+			return fmt.Errorf("failed to explore metric names: %w", err)
 		}
-		if len(metrics) == 0 {
+		if len(metricsMap) == 0 {
 			errMsg := "no metrics found"
 			if tenantID != "" {
 				errMsg = fmt.Sprintf("%s for tenant id: %s", errMsg, tenantID)
@@ -223,23 +232,28 @@ func (p *vmNativeProcessor) runBackfilling(ctx context.Context, tenantID string,
 			log.Println(errMsg)
 			return nil
 		}
-		for _, m := range metrics {
+		for _, m := range metricsMap {
 			requestsToMake += len(m)
 		}
-		foundSeriesMsg = fmt.Sprintf("Found %d unique metric names to import. Total import/export requests to make %d", len(metrics), requestsToMake)
+		foundSeriesMsg = fmt.Sprintf("Found %d unique metric names to import. Total import/export requests to make %d", len(metricsMap), requestsToMake)
+
+		migrationMetricsTotal.Add(len(metricsMap))
+	} else {
+		requestsToMake = len(ranges)
 	}
 
 	if !p.interCluster {
 		// do not prompt for intercluster because there could be many tenants,
 		// and we don't want to interrupt the process when moving to the next tenant.
 		question := foundSeriesMsg + ". Continue?"
-		if !prompt(question) {
+		if !prompt(ctx, question) {
 			return nil
 		}
 	} else {
 		log.Print(foundSeriesMsg)
 	}
 
+	migrationRequestsPlanned.Add(requestsToMake)
 	bar := barpool.NewSingleProgress(format, requestsToMake)
 	bar.Start()
 	defer bar.Finish()
@@ -248,10 +262,8 @@ func (p *vmNativeProcessor) runBackfilling(ctx context.Context, tenantID string,
 	errCh := make(chan error, p.cc)
 
 	var wg sync.WaitGroup
-	for i := 0; i < p.cc; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range p.cc {
+		wg.Go(func() {
 			for f := range filterCh {
 				if !p.disablePerMetricRequests {
 					if err := p.do(ctx, f, srcURL, dstURL, nil); err != nil {
@@ -265,12 +277,13 @@ func (p *vmNativeProcessor) runBackfilling(ctx context.Context, tenantID string,
 						return
 					}
 				}
+				migrationRequestsCompleted.Inc()
 			}
-		}()
+		})
 	}
 
 	// any error breaks the import
-	for mName, mRanges := range metrics {
+	for mName, mRanges := range metricsMap {
 		match, err := buildMatchWithFilter(p.filter.Match, mName)
 		if err != nil {
 			logger.Errorf("failed to build filter %q for metric name %q: %s", p.filter.Match, mName, err)
@@ -282,13 +295,16 @@ func (p *vmNativeProcessor) runBackfilling(ctx context.Context, tenantID string,
 			case <-ctx.Done():
 				return fmt.Errorf("context canceled")
 			case infErr := <-errCh:
-				return fmt.Errorf("export/import error: %s", infErr)
+				return fmt.Errorf("export/import error: %w", infErr)
 			case filterCh <- native.Filter{
 				Match:     match,
 				TimeStart: times[0].Format(time.RFC3339),
 				TimeEnd:   times[1].Format(time.RFC3339),
 			}:
 			}
+		}
+		if !p.disablePerMetricRequests {
+			migrationMetricsProcessed.Inc()
 		}
 	}
 
@@ -297,7 +313,7 @@ func (p *vmNativeProcessor) runBackfilling(ctx context.Context, tenantID string,
 	close(errCh)
 
 	for err := range errCh {
-		return fmt.Errorf("import process failed: %s", err)
+		return fmt.Errorf("import process failed: %w", err)
 	}
 
 	return nil
@@ -398,3 +414,18 @@ func buildMatchWithFilter(filter string, metricName string) (string, error) {
 	match := "{" + strings.Join(filters, " or ") + "}"
 	return match, nil
 }
+
+var (
+	migrationMetricsTotal     = metrics.NewCounter(`vmctl_vm_native_migration_metrics_total`)
+	migrationMetricsProcessed = metrics.NewCounter(`vmctl_vm_native_migration_metrics_processed`)
+
+	migrationRequestsPlanned   = metrics.NewCounter(`vmctl_vm_native_migration_requests_planned`)
+	migrationRequestsCompleted = metrics.NewCounter(`vmctl_vm_native_migration_requests_completed`)
+
+	migrationErrorsTotal = metrics.NewCounter(`vmctl_vm_native_migration_errors_total`)
+
+	migrationTenantsTotal     = metrics.NewCounter(`vmctl_vm_native_migration_tenants_total`)
+	migrationTenantsProcessed = metrics.NewCounter(`vmctl_vm_native_migration_tenants_processed`)
+
+	migrationBytesTransferredTotal = metrics.NewCounter(`vmctl_vm_native_migration_bytes_transferred_total`)
+)

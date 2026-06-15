@@ -338,7 +338,7 @@ Following convention is a good practice.
 
 Every measurement can contain an arbitrary number of `key="value"` labels. The good practice is to keep this number limited.
 Otherwise, it would be difficult to deal with measurements containing a big number of labels.
-By default, VictoriaMetrics limits the number of labels per measurement to `30` and drops other labels.
+By default, VictoriaMetrics limits the number of labels per measurement to `40` and drops other labels.
 This limit can be changed via `-maxLabelsPerTimeseries` command-line flag if necessary (but this isn't recommended).
 
 Every label value can contain an arbitrary string value. The good practice is to use short and meaningful label values to
@@ -727,7 +727,7 @@ response, where most of them are `ephemeral`.
 
 Sometimes, the lookbehind window for locating the datapoint isn't big enough and the graph will contain a gap. For range
 queries, lookbehind window isn't equal to the `step` parameter. It is calculated as the median of the intervals between
-the first 20 raw samples in the requested time range. In this way, VictoriaMetrics automatically adjusts the lookbehind
+the last 20 raw samples in the requested time range. In this way, VictoriaMetrics automatically adjusts the lookbehind
 window to fill gaps and detect stale series at the same time.
 
 Range queries are mostly used for plotting time series data over specified time ranges. These queries are extremely

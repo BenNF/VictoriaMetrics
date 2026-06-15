@@ -21,6 +21,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/decimal"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/flagutil"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/ioutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/leveledbytebufferpool"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promauth"
@@ -87,7 +88,7 @@ type ScrapeWork struct {
 	// These labels are needed for relabeling troubleshooting at /targets page.
 	//
 	// OriginalLabels are sorted by name.
-	OriginalLabels *promutil.Labels
+	OriginalLabels *compressedLabels
 
 	// Labels to add to the scraped metrics.
 	//
@@ -243,6 +244,9 @@ type scrapeWork struct {
 
 	// successRequestsCount is the number of success requests during the last suppressScrapeErrorsDelay
 	successRequestsCount int
+
+	// lastScrapeSuccess indicates whether last scrape is success or not.
+	lastScrapeSuccess bool
 }
 
 // loadLastScrape appends last scrape response to dst and returns the result.
@@ -430,7 +434,7 @@ func (sw *scrapeWork) getTargetResponse() ([]byte, error) {
 	}
 
 	var bb bytesutil.ByteBuffer
-	err = readFromBuffer(&bb, cb, isGzipped)
+	err = sw.readFromBuffer(&bb, cb, isGzipped)
 	return bb.B, err
 }
 
@@ -458,7 +462,7 @@ func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error
 	// the parsed results to remote storage.
 	body := leveledbytebufferpool.Get(sw.prevBodyLen)
 	if err == nil {
-		err = readFromBuffer(body, cb, isGzipped)
+		err = sw.readFromBuffer(body, cb, isGzipped)
 	}
 	chunkedbuffer.Put(cb)
 
@@ -487,20 +491,32 @@ func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error
 
 var processScrapedDataConcurrencyLimitCh = make(chan struct{}, cgroup.AvailableCPUs())
 
-func readFromBuffer(dst *bytesutil.ByteBuffer, src *chunkedbuffer.Buffer, isGzipped bool) error {
+func (sw *scrapeWork) readFromBuffer(dst *bytesutil.ByteBuffer, src *chunkedbuffer.Buffer, isGzipped bool) error {
 	if !isGzipped {
 		src.MustWriteTo(dst)
 		return nil
 	}
 
-	reader, err := protoparserutil.GetUncompressedReader(src.NewReader(), "gzip")
+	r := src.NewReader()
+	reader, err := protoparserutil.GetUncompressedReader(r, "gzip")
 	if err != nil {
-		return fmt.Errorf("cannot decompress response body: %w", err)
+		return fmt.Errorf("cannot decompress response body from %s: %w", sw.Config.ScrapeURL, err)
 	}
-	_, err = dst.ReadFrom(reader)
+
+	lr := ioutil.GetLimitedReader(reader, sw.Config.MaxScrapeSize+1)
+	_, err = dst.ReadFrom(lr)
+	ioutil.PutLimitedReader(lr)
+
 	protoparserutil.PutUncompressedReader(reader)
 	if err != nil {
-		return fmt.Errorf("cannot read gzipped response body: %w", err)
+		return fmt.Errorf("cannot read gzipped response body from %s: %w", sw.Config.ScrapeURL, err)
+	}
+
+	if int64(dst.Len()) > sw.Config.MaxScrapeSize {
+		maxScrapeSizeExceeded.Inc()
+		return fmt.Errorf("the uncompressed response from %q exceeds -promscrape.maxScrapeSize or max_scrape_size in the scrape config (%d bytes). "+
+			"Possible solutions are: reduce the response size for the target, increase -promscrape.maxScrapeSize command-line flag, "+
+			"increase max_scrape_size value in scrape config for the given target", sw.Config.ScrapeURL, sw.Config.MaxScrapeSize)
 	}
 	return nil
 }
@@ -517,6 +533,8 @@ func (sw *scrapeWork) processDataOneShot(scrapeTimestamp, realTimestamp int64, b
 	areIdenticalSeries := areIdenticalSeries(cfg, lastScrapeStr, bodyString)
 
 	wc := writeRequestCtxPool.Get(sw.prevLabelsLen)
+	lastScrapeSuccess := sw.lastScrapeSuccess
+
 	if err != nil {
 		up = 0
 		scrapesFailed.Inc()
@@ -558,6 +576,9 @@ func (sw *scrapeWork) processDataOneShot(scrapeTimestamp, realTimestamp int64, b
 
 	if up == 0 {
 		bodyString = ""
+		sw.lastScrapeSuccess = false
+	} else {
+		sw.lastScrapeSuccess = true
 	}
 	seriesAdded := 0
 	if !areIdenticalSeries {
@@ -587,10 +608,15 @@ func (sw *scrapeWork) processDataOneShot(scrapeTimestamp, realTimestamp int64, b
 	sw.prevLabelsLen = len(wc.labels)
 	writeRequestCtxPool.Put(wc)
 
-	if !areIdenticalSeries {
+	if !areIdenticalSeries && (lastScrapeSuccess || err == nil) {
 		// Send stale markers for disappeared metrics with the real scrape timestamp
 		// in order to guarantee that query doesn't return data after this time for the disappeared metrics.
 		sw.sendStaleSeries(lastScrapeStr, bodyString, realTimestamp, false)
+	}
+
+	if !areIdenticalSeries && err == nil {
+		// Only update last scrape result when the current scrape is successful.
+		// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/10653.
 		sw.storeLastScrape(bodyString)
 		sw.lastScrapeLen = len(bodyString)
 	}
@@ -607,6 +633,7 @@ func (sw *scrapeWork) processDataInStreamMode(scrapeTimestamp, realTimestamp int
 	var maxLabelsLen atomic.Int64
 
 	maxLabelsLen.Store(int64(sw.prevLabelsLen))
+	lastScrapeSuccess := sw.lastScrapeSuccess
 
 	bbLastScrape := leveledbytebufferpool.Get(sw.lastScrapeLen)
 	bbLastScrape.B = sw.loadLastScrape(bbLastScrape.B)
@@ -669,6 +696,9 @@ func (sw *scrapeWork) processDataInStreamMode(scrapeTimestamp, realTimestamp int
 		up = 0
 		bodyString = ""
 		scrapesFailed.Inc()
+		sw.lastScrapeSuccess = false
+	} else {
+		sw.lastScrapeSuccess = true
 	}
 	seriesAdded := 0
 	if !areIdenticalSeries {
@@ -690,10 +720,15 @@ func (sw *scrapeWork) processDataInStreamMode(scrapeTimestamp, realTimestamp int
 	}
 	sw.pushAutoMetrics(am, scrapeTimestamp)
 
-	if !areIdenticalSeries {
+	if !areIdenticalSeries && (lastScrapeSuccess || err == nil) {
 		// Send stale markers for disappeared metrics with the real scrape timestamp
 		// in order to guarantee that query doesn't return data after this time for the disappeared metrics.
 		sw.sendStaleSeries(lastScrapeStr, bodyString, realTimestamp, false)
+	}
+
+	if !areIdenticalSeries && err == nil {
+		// Only update last scrape result when the current scrape is successful.
+		// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/10653.
 		sw.storeLastScrape(bodyString)
 		sw.lastScrapeLen = len(bodyString)
 	}
@@ -742,7 +777,7 @@ type leveledWriteRequestCtxPool struct {
 
 func (lwp *leveledWriteRequestCtxPool) Get(labelsLen int) *writeRequestCtx {
 	id, _ := lwp.getPoolIDAndCapacity(labelsLen)
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		if id < 0 || id >= len(lwp.pools) {
 			break
 		}
@@ -926,6 +961,7 @@ func getLabelsHash(labels []prompb.Label) uint64 {
 
 	for _, label := range labels {
 		b = append(b, label.Name...)
+		b = append(b, '=')
 		b = append(b, label.Value...)
 	}
 	h := xxhash.Sum64(b)
@@ -961,8 +997,9 @@ func isAutoMetric(s string) bool {
 		"scrape_samples_scraped",
 		"scrape_series_added",
 		"scrape_series_current",
-		"scrape_series_limit",
 		"scrape_series_limit_samples_dropped",
+		"scrape_series_limit",
+		"scrape_labels_limit",
 		"scrape_timeout_seconds":
 		return true
 	default:
@@ -977,7 +1014,7 @@ func isAutoMetric(s string) bool {
 // sw is used as read-only config source.
 func (wc *writeRequestCtx) addAutoMetrics(sw *scrapeWork, am *autoMetrics, timestamp int64) {
 	rows := getAutoRows()
-	dst := slicesutil.SetLength(rows.Rows, 11)[:0]
+	dst := slicesutil.SetLength(rows.Rows, 12)[:0]
 
 	dst = appendRow(dst, "scrape_duration_seconds", am.scrapeDurationSeconds, timestamp)
 	dst = appendRow(dst, "scrape_response_size_bytes", float64(am.scrapeResponseSize), timestamp)

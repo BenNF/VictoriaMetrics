@@ -75,11 +75,6 @@ func insertRows(at *auth.Token, timeseries []prompb.TimeSeries, mms []prompb.Met
 
 	var metadataTotal int
 	if prommetadata.IsEnabled() {
-		var accountID, projectID uint32
-		if at != nil {
-			accountID = at.AccountID
-			projectID = at.ProjectID
-		}
 		for i := range mms {
 			mm := &mms[i]
 			mmsDst = append(mmsDst, prompb.MetricMetadata{
@@ -88,8 +83,8 @@ func insertRows(at *auth.Token, timeseries []prompb.TimeSeries, mms []prompb.Met
 				Type:             mm.Type,
 				Unit:             mm.Unit,
 
-				AccountID: accountID,
-				ProjectID: projectID,
+				AccountID: mm.AccountID,
+				ProjectID: mm.ProjectID,
 			})
 		}
 		ctx.WriteRequest.Metadata = mmsDst

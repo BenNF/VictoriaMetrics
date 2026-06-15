@@ -11,8 +11,8 @@ import (
 	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/datasource"
-	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/vmalertutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/flagutil"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/httputil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promauth"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
@@ -36,6 +36,7 @@ var (
 		"For example, -remoteWrite.headers='My-Auth:foobar' would send 'My-Auth: foobar' HTTP header with every request to the corresponding -notifier.url. "+
 		"Multiple headers must be delimited by '^^': -notifier.headers='header1:value1^^header2:value2,header3:value3'")
 	basicAuthUsername     = flagutil.NewArrayString("notifier.basicAuth.username", "Optional basic auth username for -notifier.url")
+	basicAuthUsernameFile = flagutil.NewArrayString("notifier.basicAuth.usernameFile", "Optional path to basic auth username file for -notifier.url")
 	basicAuthPassword     = flagutil.NewArrayString("notifier.basicAuth.password", "Optional basic auth password for -notifier.url")
 	basicAuthPasswordFile = flagutil.NewArrayString("notifier.basicAuth.passwordFile", "Optional path to basic auth password file for -notifier.url")
 
@@ -193,6 +194,7 @@ func InitSecretFlags() {
 	if !*showNotifierURL {
 		flagutil.RegisterSecretFlag("notifier.url")
 	}
+	flagutil.RegisterSecretFlag("notifier.headers")
 }
 
 func notifiersFromFlags(gen AlertURLGenerator) ([]Notifier, error) {
@@ -213,6 +215,7 @@ func notifiersFromFlags(gen AlertURLGenerator) ([]Notifier, error) {
 			},
 			BasicAuth: &promauth.BasicAuthConfig{
 				Username:     basicAuthUsername.GetOptionalArg(i),
+				UsernameFile: basicAuthUsernameFile.GetOptionalArg(i),
 				Password:     promauth.NewSecret(basicAuthPassword.GetOptionalArg(i)),
 				PasswordFile: basicAuthPasswordFile.GetOptionalArg(i),
 			},
@@ -229,6 +232,9 @@ func notifiersFromFlags(gen AlertURLGenerator) ([]Notifier, error) {
 			Headers: []string{headers.GetOptionalArg(i)},
 		}
 
+		if err := httputil.CheckURL(addr); err != nil {
+			return nil, fmt.Errorf("invalid notifier.url %q: %w", addr, err)
+		}
 		addr = strings.TrimSuffix(addr, "/")
 		am, err := NewAlertManager(addr+alertManagerPath, gen, authCfg, nil, sendTimeout.GetOptionalArg(i))
 		if err != nil {
@@ -266,7 +272,7 @@ func GetTargets() map[TargetType][]Target {
 	if getActiveNotifiers == nil {
 		return nil
 	}
-	var targets = make(map[TargetType][]Target)
+	targets := make(map[TargetType][]Target)
 	// use cached targets from configWatcher instead of getActiveNotifiers for the extra target labels
 	if cw != nil {
 		cw.targetsMu.RLock()
@@ -287,7 +293,7 @@ func GetTargets() map[TargetType][]Target {
 }
 
 // Send sends alerts to all active notifiers
-func Send(ctx context.Context, alerts []Alert, notifierHeaders map[string]string) *vmalertutil.ErrGroup {
+func Send(ctx context.Context, alerts []Alert, notifierHeaders map[string]string) chan error {
 	alertsToSend := make([]Alert, 0, len(alerts))
 	lblss := make([][]prompb.Label, 0, len(alerts))
 	// apply global relabel config first without modifying original alerts in alerts
@@ -300,17 +306,18 @@ func Send(ctx context.Context, alerts []Alert, notifierHeaders map[string]string
 		lblss = append(lblss, lbls)
 	}
 
-	errGr := new(vmalertutil.ErrGroup)
 	wg := sync.WaitGroup{}
 	activeNotifiers := getActiveNotifiers()
+	errCh := make(chan error, len(activeNotifiers))
+	defer close(errCh)
 	for i := range activeNotifiers {
 		nt := activeNotifiers[i]
 		wg.Go(func() {
 			if err := nt.Send(ctx, alertsToSend, lblss, notifierHeaders); err != nil {
-				errGr.Add(fmt.Errorf("failed to send alerts to addr %q: %w", nt.Addr(), err))
+				errCh <- fmt.Errorf("failed to send alerts to addr %q: %w", nt.Addr(), err)
 			}
 		})
 	}
 	wg.Wait()
-	return errGr
+	return errCh
 }

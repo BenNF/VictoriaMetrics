@@ -16,10 +16,12 @@ export interface ChartTooltipProps {
   point: { top: number, left: number };
   unit?: string;
   statsFormatted?: SeriesItemStatsFormatted;
+  description?: ReactNode;
   isSticky?: boolean;
   info?: ReactNode;
   marker?: string;
   show?: boolean;
+  duplicateCount?: number;
   onClose?: (id: string) => void;
 }
 
@@ -33,8 +35,10 @@ const ChartTooltip: FC<ChartTooltipProps> = ({
   unit = "",
   info,
   statsFormatted,
+  description,
   isSticky,
   marker,
+  duplicateCount = 0,
   onClose
 }) => {
   const tooltipRef = useRef<HTMLDivElement>(null);
@@ -156,6 +160,7 @@ const ChartTooltip: FC<ChartTooltipProps> = ({
         <p className="vm-chart-tooltip-data__value">
           <b>{value}</b>{unit}
         </p>
+        {duplicateCount > 1 && <p>(overlapping points: {duplicateCount})</p>}
       </div>
       {statsFormatted && (
         <table className="vm-chart-tooltip-stats">
@@ -170,6 +175,7 @@ const ChartTooltip: FC<ChartTooltipProps> = ({
           ))}
         </table>
       )}
+      {description && <p className="vm-chart-tooltip__description">{description}</p>}
       {info && <p className="vm-chart-tooltip__info">{info}</p>}
     </div>
   ), u.root);

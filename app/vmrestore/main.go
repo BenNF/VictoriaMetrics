@@ -30,6 +30,7 @@ var (
 	concurrency             = flag.Int("concurrency", 10, "The number of concurrent workers. Higher concurrency may reduce restore duration")
 	maxBytesPerSecond       = flagutil.NewBytes("maxBytesPerSecond", 0, "The maximum download speed. There is no limit if it is set to 0")
 	skipBackupCompleteCheck = flag.Bool("skipBackupCompleteCheck", false, "Whether to skip checking for 'backup complete' file in -src. This may be useful for restoring from old backups, which were created without 'backup complete' file")
+	SkipPreallocation       = flag.Bool("skipFilePreallocation", false, "Whether to skip pre-allocated files. This will likely be slower in most cases, but allows restores to resume mid file on failure")
 )
 
 func main() {
@@ -63,6 +64,7 @@ func main() {
 		Src:                     srcFS,
 		Dst:                     dstFS,
 		SkipBackupCompleteCheck: *skipBackupCompleteCheck,
+		SkipPreallocation:       *SkipPreallocation,
 	}
 	pushmetrics.Init()
 	if err := a.Run(ctx); err != nil {
@@ -104,7 +106,7 @@ func newDstFS() (*fslocal.FS, error) {
 }
 
 func newSrcFS(ctx context.Context) (common.RemoteFS, error) {
-	fs, err := actions.NewRemoteFS(ctx, *src)
+	fs, err := actions.NewRemoteFS(ctx, *src, nil)
 	if err != nil {
 		return nil, fmt.Errorf("cannot parse `-src`=%q: %w", *src, err)
 	}

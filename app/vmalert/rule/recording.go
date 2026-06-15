@@ -2,6 +2,7 @@ package rule
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -197,7 +198,7 @@ func (rr *RecordingRule) exec(ctx context.Context, ts time.Time, limit int) ([]p
 
 	defer func() {
 		rr.state.add(curState)
-		if curState.Err != nil {
+		if curState.Err != nil && !errors.Is(curState.Err, context.Canceled) {
 			rr.metrics.errors.Inc()
 		}
 	}()
@@ -292,9 +293,11 @@ func (rr *RecordingRule) toTimeSeries(m datasource.Metric) prompb.TimeSeries {
 	}
 	// add extra labels configured by user
 	for k := range rr.Labels {
-		// do not add label with empty value, since it has no meaning.
-		// see https://github.com/VictoriaMetrics/VictoriaMetrics/issues/9984
+		// do not add label with empty value to the result, as it has no meaning:
+		// if the label already exists in the original query result, remove it to preserve compatibility with relabeling, see https://github.com/VictoriaMetrics/VictoriaMetrics/issues/10766.
+		// otherwise, ignore the label, see https://github.com/VictoriaMetrics/VictoriaMetrics/issues/9984.
 		if rr.Labels[k] == "" {
+			m.DelLabel(k)
 			continue
 		}
 		existingLabel := promrelabel.GetLabelByName(m.Labels, k)

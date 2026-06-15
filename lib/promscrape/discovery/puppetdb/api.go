@@ -19,7 +19,7 @@ type apiConfig struct {
 }
 
 func getAPIConfig(sdc *SDConfig, baseDir string) (*apiConfig, error) {
-	v, err := configMap.Get(sdc, func() (interface{}, error) { return newAPIConfig(sdc, baseDir) })
+	v, err := configMap.Get(sdc, func() (any, error) { return newAPIConfig(sdc, baseDir) })
 	if err != nil {
 		return nil, err
 	}
@@ -33,7 +33,7 @@ func newAPIConfig(sdc *SDConfig, baseDir string) (*apiConfig, error) {
 	}
 	parsedURL, err := url.Parse(sdc.URL)
 	if err != nil {
-		return nil, fmt.Errorf("parse URL %s error: %v", sdc.URL, err)
+		return nil, fmt.Errorf("cannot parse %s: %w", sdc.URL, err)
 	}
 	if parsedURL.Scheme != "http" && parsedURL.Scheme != "https" {
 		return nil, fmt.Errorf("URL %s scheme must be 'http' or 'https'", sdc.URL)

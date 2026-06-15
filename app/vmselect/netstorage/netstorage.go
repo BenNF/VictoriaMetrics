@@ -5,6 +5,8 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"math"
+	"slices"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -20,14 +22,11 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/querytracer"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storage"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storage/metricnamestats"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storage/metricsmetadata"
 )
 
 var (
-	maxTagKeysPerSearch = flag.Int("search.maxTagKeys", 100e3, "The maximum number of tag keys returned from /api/v1/labels . "+
-		"See also -search.maxLabelsAPISeries and -search.maxLabelsAPIDuration")
-	maxTagValuesPerSearch = flag.Int("search.maxTagValues", 100e3, "The maximum number of tag values returned from /api/v1/label/<label_name>/values . "+
-		"See also -search.maxLabelsAPISeries and -search.maxLabelsAPIDuration")
 	maxSamplesPerSeries = flag.Int("search.maxSamplesPerSeries", 30e6, "The maximum number of raw samples a single query can scan per each time series. This option allows limiting memory usage")
 	maxSamplesPerQuery  = flag.Int("search.maxSamplesPerQuery", 1e9, "The maximum number of raw samples a single query can process across all time series. "+
 		"This protects from heavy queries, which select unexpectedly high number of raw samples. See also -search.maxSamplesPerSeries")
@@ -77,7 +76,7 @@ func (rss *Results) Cancel() {
 }
 
 func (rss *Results) mustClose() {
-	putStorageSearch(rss.sr)
+	vmstorage.PutSearch(rss.sr)
 	rss.sr = nil
 	putTmpBlocksFile(rss.tbf)
 	rss.tbf = nil
@@ -296,14 +295,12 @@ func (rss *Results) runParallel(qt *querytracer.Tracer, f func(rs *Result, worke
 
 	// Start workers and wait until they finish the work.
 	var wg sync.WaitGroup
-	for i := range workChs {
-		wg.Add(1)
-		qtChild := qt.NewChild("worker #%d", i)
-		go func(workerID uint) {
-			timeseriesWorker(qtChild, workChs, workerID)
+	for workerID := range workChs {
+		qtChild := qt.NewChild("worker #%d", workerID)
+		wg.Go(func() {
+			timeseriesWorker(qtChild, workChs, uint(workerID))
 			qtChild.Done()
-			wg.Done()
-		}(uint(i))
+		})
 	}
 	wg.Wait()
 
@@ -492,10 +489,7 @@ func (pts *packedTimeseries) unpackTo(dst []*sortBlock, tbf *tmpBlocksFile, tr s
 	}
 
 	// Prepare worker channels.
-	workers := min(len(upws), gomaxprocs)
-	if workers < 1 {
-		workers = 1
-	}
+	workers := max(min(len(upws), gomaxprocs), 1)
 	itemsPerWorker := (len(upws) + workers - 1) / workers
 	workChs := make([]chan *unpackWork, workers)
 	for i := range workChs {
@@ -514,12 +508,10 @@ func (pts *packedTimeseries) unpackTo(dst []*sortBlock, tbf *tmpBlocksFile, tr s
 
 	// Start workers and wait until they finish the work.
 	var wg sync.WaitGroup
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go func(workerID uint) {
-			unpackWorker(workChs, workerID)
-			wg.Done()
-		}(uint(i))
+	for workerID := range workers {
+		wg.Go(func() {
+			unpackWorker(workChs, uint(workerID))
+		})
 	}
 	wg.Wait()
 
@@ -582,6 +574,7 @@ func mergeSortBlocks(dst *Result, sbh *sortBlocksHeap, dedupInterval int64) {
 		return
 	}
 	heap.Init(sbh)
+	var dedupSamples int
 	for {
 		sbs := sbh.sbs
 		top := sbs[0]
@@ -597,6 +590,7 @@ func mergeSortBlocks(dst *Result, sbh *sortBlocksHeap, dedupInterval int64) {
 		if n := equalSamplesPrefix(top, sbNext); n > 0 && dedupInterval > 0 {
 			// Skip n replicated samples at top if deduplication is enabled.
 			top.NextIdx = topNextIdx + n
+			dedupSamples += n
 		} else {
 			// Copy samples from top to dst with timestamps not exceeding tsNext.
 			top.NextIdx = topNextIdx + binarySearchTimestamps(top.Timestamps[topNextIdx:], tsNext)
@@ -611,8 +605,8 @@ func mergeSortBlocks(dst *Result, sbh *sortBlocksHeap, dedupInterval int64) {
 		}
 	}
 	timestamps, values := storage.DeduplicateSamples(dst.Timestamps, dst.Values, dedupInterval)
-	dedups := len(dst.Timestamps) - len(timestamps)
-	dedupsDuringSelect.Add(dedups)
+	dedupSamples += len(dst.Timestamps) - len(timestamps)
+	dedupsDuringSelect.Add(dedupSamples)
 	dst.Timestamps = timestamps
 	dst.Values = values
 }
@@ -638,7 +632,7 @@ func equalTimestampsPrefix(a, b []int64) int {
 
 func equalValuesPrefix(a, b []float64) int {
 	for i, v := range a {
-		if i >= len(b) || v != b[i] {
+		if i >= len(b) || math.Float64bits(v) != math.Float64bits(b[i]) {
 			return i
 		}
 	}
@@ -760,12 +754,7 @@ var sbhPool sync.Pool
 func DeleteSeries(qt *querytracer.Tracer, sq *storage.SearchQuery, deadline searchutil.Deadline) (int, error) {
 	qt = qt.NewChild("delete series: %s", sq)
 	defer qt.Done()
-	tr := sq.GetTimeRange()
-	tfss, err := setupTfss(qt, tr, sq.TagFilterss, sq.MaxMetrics, deadline)
-	if err != nil {
-		return 0, err
-	}
-	return vmstorage.DeleteSeries(qt, tfss, sq.MaxMetrics)
+	return vmstorage.VMSelectAPI.DeleteSeries(qt, sq, deadline.Deadline())
 }
 
 // LabelNames returns label names matching the given sq until the given deadline.
@@ -775,15 +764,7 @@ func LabelNames(qt *querytracer.Tracer, sq *storage.SearchQuery, maxLabelNames i
 	if deadline.Exceeded() {
 		return nil, fmt.Errorf("timeout exceeded before starting the query processing: %s", deadline.String())
 	}
-	if maxLabelNames > *maxTagKeysPerSearch || maxLabelNames <= 0 {
-		maxLabelNames = *maxTagKeysPerSearch
-	}
-	tr := sq.GetTimeRange()
-	tfss, err := setupTfss(qt, tr, sq.TagFilterss, sq.MaxMetrics, deadline)
-	if err != nil {
-		return nil, err
-	}
-	labels, err := vmstorage.SearchLabelNames(qt, tfss, tr, maxLabelNames, sq.MaxMetrics, deadline.Deadline())
+	labels, err := vmstorage.VMSelectAPI.LabelNames(qt, sq, maxLabelNames, deadline.Deadline())
 	if err != nil {
 		return nil, fmt.Errorf("error during labels search on time range: %w", err)
 	}
@@ -833,12 +814,7 @@ func GraphiteTags(qt *querytracer.Tracer, filter string, limit int, deadline sea
 }
 
 func hasString(a []string, s string) bool {
-	for _, x := range a {
-		if x == s {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(a, s)
 }
 
 // LabelValues returns label values matching the given labelName and sq until the given deadline.
@@ -848,15 +824,7 @@ func LabelValues(qt *querytracer.Tracer, labelName string, sq *storage.SearchQue
 	if deadline.Exceeded() {
 		return nil, fmt.Errorf("timeout exceeded before starting the query processing: %s", deadline.String())
 	}
-	if maxLabelValues > *maxTagValuesPerSearch || maxLabelValues <= 0 {
-		maxLabelValues = *maxTagValuesPerSearch
-	}
-	tr := sq.GetTimeRange()
-	tfss, err := setupTfss(qt, tr, sq.TagFilterss, sq.MaxMetrics, deadline)
-	if err != nil {
-		return nil, err
-	}
-	labelValues, err := vmstorage.SearchLabelValues(qt, labelName, tfss, tr, maxLabelValues, sq.MaxMetrics, deadline.Deadline())
+	labelValues, err := vmstorage.VMSelectAPI.LabelValues(qt, sq, labelName, maxLabelValues, deadline.Deadline())
 	if err != nil {
 		return nil, fmt.Errorf("error during label values search on time range for labelName=%q: %w", labelName, err)
 	}
@@ -871,7 +839,10 @@ func GetMetricsMetadata(qt *querytracer.Tracer, limit int, metricName string) ([
 	qt = qt.NewChild("get metrics metadata: limit=%d, metric_name=%q", limit, metricName)
 	defer qt.Done()
 
-	metadata := vmstorage.Storage.GetMetadataRows(qt, limit, metricName)
+	metadata, err := vmstorage.VMSelectAPI.GetMetadataRecords(qt, nil, limit, metricName, 0)
+	if err != nil {
+		return nil, err
+	}
 
 	sort.Slice(metadata, func(i, j int) bool {
 		return string(metadata[i].MetricFamilyName) < string(metadata[j].MetricFamilyName)
@@ -919,15 +890,10 @@ func TagValueSuffixes(qt *querytracer.Tracer, tr storage.TimeRange, tagKey, tagV
 	if deadline.Exceeded() {
 		return nil, fmt.Errorf("timeout exceeded before starting the query processing: %s", deadline.String())
 	}
-	suffixes, err := vmstorage.SearchTagValueSuffixes(qt, tr, tagKey, tagValuePrefix, delimiter, maxSuffixes, deadline.Deadline())
+	suffixes, err := vmstorage.VMSelectAPI.TagValueSuffixes(qt, 0, 0, tr, tagKey, tagValuePrefix, delimiter, maxSuffixes, deadline.Deadline())
 	if err != nil {
 		return nil, fmt.Errorf("error during search for suffixes for tagKey=%q, tagValuePrefix=%q, delimiter=%c on time range %s: %w",
 			tagKey, tagValuePrefix, delimiter, tr.String(), err)
-	}
-	if len(suffixes) >= maxSuffixes {
-		return nil, fmt.Errorf("more than -search.maxTagValueSuffixesPerSearch=%d tag value suffixes found for tagKey=%q, tagValuePrefix=%q, delimiter=%c on time range %s; "+
-			"either narrow down the query or increase -search.maxTagValueSuffixesPerSearch command-line flag value",
-			maxSuffixes, tagKey, tagValuePrefix, delimiter, tr.String())
 	}
 	return suffixes, nil
 }
@@ -941,13 +907,7 @@ func TSDBStatus(qt *querytracer.Tracer, sq *storage.SearchQuery, focusLabel stri
 	if deadline.Exceeded() {
 		return nil, fmt.Errorf("timeout exceeded before starting the query processing: %s", deadline.String())
 	}
-	tr := sq.GetTimeRange()
-	tfss, err := setupTfss(qt, tr, sq.TagFilterss, sq.MaxMetrics, deadline)
-	if err != nil {
-		return nil, err
-	}
-	date := uint64(tr.MinTimestamp) / (3600 * 24 * 1000)
-	status, err := vmstorage.GetTSDBStatus(qt, tfss, date, focusLabel, topN, sq.MaxMetrics, deadline.Deadline())
+	status, err := vmstorage.VMSelectAPI.TSDBStatus(qt, sq, focusLabel, topN, deadline.Deadline())
 	if err != nil {
 		return nil, fmt.Errorf("error during tsdb status request: %w", err)
 	}
@@ -961,27 +921,12 @@ func SeriesCount(qt *querytracer.Tracer, deadline searchutil.Deadline) (uint64, 
 	if deadline.Exceeded() {
 		return 0, fmt.Errorf("timeout exceeded before starting the query processing: %s", deadline.String())
 	}
-	n, err := vmstorage.GetSeriesCount(deadline.Deadline())
+	n, err := vmstorage.VMSelectAPI.SeriesCount(qt, 0, 0, deadline.Deadline())
 	if err != nil {
 		return 0, fmt.Errorf("error during series count request: %w", err)
 	}
 	return n, nil
 }
-
-func getStorageSearch() *storage.Search {
-	v := ssPool.Get()
-	if v == nil {
-		return &storage.Search{}
-	}
-	return v.(*storage.Search)
-}
-
-func putStorageSearch(sr *storage.Search) {
-	sr.MustClose()
-	ssPool.Put(sr)
-}
-
-var ssPool sync.Pool
 
 // ExportBlocks searches for time series matching sq and calls f for each found block.
 //
@@ -996,21 +941,13 @@ func ExportBlocks(qt *querytracer.Tracer, sq *storage.SearchQuery, deadline sear
 	if deadline.Exceeded() {
 		return fmt.Errorf("timeout exceeded before starting data export: %s", deadline.String())
 	}
+
 	tr := sq.GetTimeRange()
-	if err := vmstorage.CheckTimeRange(tr); err != nil {
-		return err
-	}
-	tfss, err := setupTfss(qt, tr, sq.TagFilterss, sq.MaxMetrics, deadline)
+	sr, _, err := vmstorage.GetSearch(qt, sq, deadline.Deadline())
 	if err != nil {
 		return err
 	}
-
-	vmstorage.WG.Add(1)
-	defer vmstorage.WG.Done()
-
-	sr := getStorageSearch()
-	defer putStorageSearch(sr)
-	sr.Init(qt, vmstorage.Storage, tfss, tr, sq.MaxMetrics, deadline.Deadline())
+	defer vmstorage.PutSearch(sr)
 
 	// Start workers that call f in parallel on available CPU cores.
 	workCh := make(chan *exportWork, gomaxprocs*8)
@@ -1020,12 +957,10 @@ func ExportBlocks(qt *querytracer.Tracer, sq *storage.SearchQuery, deadline sear
 		mustStop      atomic.Bool
 	)
 	var wg sync.WaitGroup
-	wg.Add(gomaxprocs)
-	for i := 0; i < gomaxprocs; i++ {
-		go func(workerID uint) {
-			defer wg.Done()
+	for workerID := range gomaxprocs {
+		wg.Go(func() {
 			for xw := range workCh {
-				if err := f(&xw.mn, &xw.b, tr, workerID); err != nil {
+				if err := f(&xw.mn, &xw.b, tr, uint(workerID)); err != nil {
 					errGlobalLock.Lock()
 					if errGlobal == nil {
 						errGlobal = err
@@ -1036,7 +971,7 @@ func ExportBlocks(qt *querytracer.Tracer, sq *storage.SearchQuery, deadline sear
 				xw.reset()
 				exportWorkPool.Put(xw)
 			}
-		}(uint(i))
+		})
 	}
 
 	// Feed workers with work
@@ -1105,17 +1040,7 @@ func SearchMetricNames(qt *querytracer.Tracer, sq *storage.SearchQuery, deadline
 		return nil, fmt.Errorf("timeout exceeded before starting to search metric names: %s", deadline.String())
 	}
 
-	// Setup search.
-	tr := sq.GetTimeRange()
-	if err := vmstorage.CheckTimeRange(tr); err != nil {
-		return nil, err
-	}
-	tfss, err := setupTfss(qt, tr, sq.TagFilterss, sq.MaxMetrics, deadline)
-	if err != nil {
-		return nil, err
-	}
-
-	metricNames, err := vmstorage.SearchMetricNames(qt, tfss, tr, sq.MaxMetrics, deadline.Deadline())
+	metricNames, err := vmstorage.VMSelectAPI.SearchMetricNames(qt, sq, deadline.Deadline())
 	if err != nil {
 		return nil, fmt.Errorf("cannot find metric names: %w", err)
 	}
@@ -1134,21 +1059,11 @@ func ProcessSearchQuery(qt *querytracer.Tracer, sq *storage.SearchQuery, deadlin
 		return nil, fmt.Errorf("timeout exceeded before starting the query processing: %s", deadline.String())
 	}
 
-	// Setup search.
-	tr := sq.GetTimeRange()
-	if err := vmstorage.CheckTimeRange(tr); err != nil {
-		return nil, err
-	}
-	tfss, err := setupTfss(qt, tr, sq.TagFilterss, sq.MaxMetrics, deadline)
+	sr, maxSeriesCount, err := vmstorage.GetSearch(qt, sq, deadline.Deadline())
 	if err != nil {
 		return nil, err
 	}
 
-	vmstorage.WG.Add(1)
-	defer vmstorage.WG.Done()
-
-	sr := getStorageSearch()
-	maxSeriesCount := sr.Init(qt, vmstorage.Storage, tfss, tr, sq.MaxMetrics, deadline.Deadline())
 	type blockRefs struct {
 		brs []blockRef
 	}
@@ -1186,7 +1101,7 @@ func ProcessSearchQuery(qt *querytracer.Tracer, sq *storage.SearchQuery, deadlin
 		blocksRead++
 		if deadline.Exceeded() {
 			putTmpBlocksFile(tbf)
-			putStorageSearch(sr)
+			vmstorage.PutSearch(sr)
 			return nil, fmt.Errorf("timeout exceeded while fetching data block #%d from storage: %s", blocksRead, deadline.String())
 		}
 		br := sr.MetricBlockRef.BlockRef
@@ -1198,7 +1113,7 @@ func ProcessSearchQuery(qt *querytracer.Tracer, sq *storage.SearchQuery, deadlin
 		samples += br.RowsCount()
 		if *maxSamplesPerQuery > 0 && samples > *maxSamplesPerQuery {
 			putTmpBlocksFile(tbf)
-			putStorageSearch(sr)
+			vmstorage.PutSearch(sr)
 			return nil, fmt.Errorf("cannot select more than -search.maxSamplesPerQuery=%d samples; possible solutions: increase the -search.maxSamplesPerQuery; "+
 				"reduce time range for the query; use more specific label filters in order to select fewer series", *maxSamplesPerQuery)
 		}
@@ -1207,7 +1122,7 @@ func ProcessSearchQuery(qt *querytracer.Tracer, sq *storage.SearchQuery, deadlin
 		addr, err := tbf.WriteBlockRefData(buf)
 		if err != nil {
 			putTmpBlocksFile(tbf)
-			putStorageSearch(sr)
+			vmstorage.PutSearch(sr)
 			return nil, fmt.Errorf("cannot write %d bytes to temporary file: %w", len(buf), err)
 		}
 
@@ -1265,7 +1180,7 @@ func ProcessSearchQuery(qt *querytracer.Tracer, sq *storage.SearchQuery, deadlin
 
 	if err := sr.Error(); err != nil {
 		putTmpBlocksFile(tbf)
-		putStorageSearch(sr)
+		vmstorage.PutSearch(sr)
 		if errors.Is(err, storage.ErrDeadlineExceeded) {
 			return nil, fmt.Errorf("timeout exceeded during the query: %s", deadline.String())
 		}
@@ -1273,13 +1188,13 @@ func ProcessSearchQuery(qt *querytracer.Tracer, sq *storage.SearchQuery, deadlin
 	}
 	if err := tbf.Finalize(); err != nil {
 		putTmpBlocksFile(tbf)
-		putStorageSearch(sr)
+		vmstorage.PutSearch(sr)
 		return nil, fmt.Errorf("cannot finalize temporary file: %w", err)
 	}
 	qt.Printf("fetch unique series=%d, blocks=%d, samples=%d, bytes=%d", len(m), blocksRead, samples, tbf.Len())
 
 	var rss Results
-	rss.tr = tr
+	rss.tr = sq.GetTimeRange()
 	rss.deadline = deadline
 	pts := make([]packedTimeseries, len(orderedMetricNames))
 	for i, metricName := range orderedMetricNames {
@@ -1320,35 +1235,6 @@ func getBlockRefsEnd(a []blockRef) uintptr {
 	return uintptr(unsafe.Pointer(unsafe.SliceData(a))) + uintptr(len(a))*unsafe.Sizeof(blockRef{})
 }
 
-func setupTfss(qt *querytracer.Tracer, tr storage.TimeRange, tagFilterss [][]storage.TagFilter, maxMetrics int, deadline searchutil.Deadline) ([]*storage.TagFilters, error) {
-	tfss := make([]*storage.TagFilters, 0, len(tagFilterss))
-	for _, tagFilters := range tagFilterss {
-		tfs := storage.NewTagFilters()
-		for i := range tagFilters {
-			tf := &tagFilters[i]
-			if string(tf.Key) == "__graphite__" {
-				query := tf.Value
-				paths, err := vmstorage.SearchGraphitePaths(qt, tr, query, maxMetrics, deadline.Deadline())
-				if err != nil {
-					return nil, fmt.Errorf("error when searching for Graphite paths for query %q: %w", query, err)
-				}
-				if len(paths) >= maxMetrics {
-					return nil, fmt.Errorf("more than %d time series match Graphite query %q; "+
-						"either narrow down the query or increase the corresponding -search.max* command-line flag value; "+
-						"see https://docs.victoriametrics.com/victoriametrics/single-server-victoriametrics/#resource-usage-limits", maxMetrics, query)
-				}
-				tfs.AddGraphiteQuery(query, paths, tf.IsNegative)
-				continue
-			}
-			if err := tfs.Add(tf.Key, tf.Value, tf.IsNegative, tf.IsRegexp); err != nil {
-				return nil, fmt.Errorf("cannot parse tag filter %s: %w", tf, err)
-			}
-		}
-		tfss = append(tfss, tfs)
-	}
-	return tfss, nil
-}
-
 func applyGraphiteRegexpFilter(filter string, ss []string) ([]string, error) {
 	// Anchor filter regexp to the beginning of the string as Graphite does.
 	// See https://github.com/graphite-project/graphite-web/blob/3ad279df5cb90b211953e39161df416e54a84948/webapp/graphite/tags/localdatabase.py#L157
@@ -1372,16 +1258,15 @@ func applyGraphiteRegexpFilter(filter string, ss []string) ([]string, error) {
 const maxFastAllocBlockSize = 32 * 1024
 
 // GetMetricNamesStats returns statistic for timeseries metric names usage.
-func GetMetricNamesStats(qt *querytracer.Tracer, limit, le int, matchPattern string) (storage.MetricNamesStatsResponse, error) {
+func GetMetricNamesStats(qt *querytracer.Tracer, limit, le int, matchPattern string) (metricnamestats.StatsResult, error) {
 	qt = qt.NewChild("get metric names usage statistics with limit: %d, less or equal to: %d, match pattern=%q", limit, le, matchPattern)
 	defer qt.Done()
-	return vmstorage.GetMetricNamesStats(qt, limit, le, matchPattern)
+	return vmstorage.VMSelectAPI.GetMetricNamesUsageStats(qt, nil, limit, le, matchPattern, 0)
 }
 
 // ResetMetricNamesStats resets state of metric names usage
 func ResetMetricNamesStats(qt *querytracer.Tracer) error {
 	qt = qt.NewChild("reset metric names usage stats")
 	defer qt.Done()
-	vmstorage.ResetMetricNamesStats(qt)
-	return nil
+	return vmstorage.VMSelectAPI.ResetMetricNamesUsageStats(qt, 0)
 }
